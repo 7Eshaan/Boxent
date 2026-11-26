@@ -4,6 +4,7 @@ mod cgroup;
 mod drain;
 mod exec;
 mod files;
+mod landlock;
 mod reaper;
 mod sys;
 
@@ -32,11 +33,13 @@ pub struct Config {
     pub workdir: PathBuf,
     pub writable_roots: Vec<PathBuf>,
     pub nofile: u64,
+    /// Refuse to run commands when the kernel has no Landlock (set by the driver in sandboxes).
+    pub require_landlock: bool,
 }
 
 impl Config {
     const USAGE: &str = "usage: boxent-agent [--control-fd N] [--cgroup-root DIR] [--uid N] \
-        [--gid N] [--workdir DIR] [--writable-root DIR]... [--nofile N]";
+        [--gid N] [--workdir DIR] [--writable-root DIR]... [--nofile N] [--require-landlock]";
 
     fn parse(mut args: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut cfg = Self {
@@ -47,6 +50,7 @@ impl Config {
             workdir: "/workspace".into(),
             writable_roots: Vec::new(),
             nofile: 1024,
+            require_landlock: false,
         };
         while let Some(flag) = args.next() {
             let mut value = || {
@@ -65,6 +69,7 @@ impl Config {
                 "--workdir" => cfg.workdir = value()?.into(),
                 "--writable-root" => cfg.writable_roots.push(value()?.into()),
                 "--nofile" => cfg.nofile = num(value()?)?,
+                "--require-landlock" => cfg.require_landlock = true,
                 _ => return Err(format!("unknown argument {flag}\n{}", Self::USAGE)),
             }
         }
@@ -229,6 +234,7 @@ fn run(cfg: Config) -> io::Result<()> {
                         protocol: PROTOCOL_VERSION,
                         agent_version: env!("CARGO_PKG_VERSION").into(),
                         pid: std::process::id(),
+                        landlock_abi: landlock::abi() as u32,
                     })
                 } else {
                     Response::Error(AgentError::new(

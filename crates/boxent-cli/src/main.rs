@@ -1,8 +1,10 @@
 //! The `boxent` command.
 //!
-//! M0 provides `doctor` (environment checks) and `vm` (the Lima VM that hosts the engine on macOS).
-//! `daemon` and `mcp` arrive with milestones M3 and M4.
+//! `doctor` checks the environment, `vm` manages the Lima VM that hosts the engine on macOS, and
+//! on Linux `image` and `sandbox` are development helpers. `daemon` and `mcp` arrive in M3 and M4.
 
+#[cfg(target_os = "linux")]
+mod dev;
 mod doctor;
 mod vm;
 
@@ -47,6 +49,18 @@ enum Command {
         #[command(subcommand)]
         command: vm::VmCommand,
     },
+    /// Build root filesystem images (Linux, as root).
+    #[cfg(target_os = "linux")]
+    Image {
+        #[command(subcommand)]
+        command: dev::ImageCommand,
+    },
+    /// Development helpers for single sandboxes (Linux, as root).
+    #[cfg(target_os = "linux")]
+    Sandbox {
+        #[command(subcommand)]
+        command: dev::SandboxCommand,
+    },
 }
 
 fn main() -> ExitCode {
@@ -62,6 +76,10 @@ fn main() -> ExitCode {
             data_dir,
         }),
         Command::Vm { command } => vm::run(command).map(|()| true),
+        #[cfg(target_os = "linux")]
+        Command::Image { command } => dev::image(command),
+        #[cfg(target_os = "linux")]
+        Command::Sandbox { command } => dev::sandbox(command),
     };
     match result {
         Ok(true) => ExitCode::SUCCESS,

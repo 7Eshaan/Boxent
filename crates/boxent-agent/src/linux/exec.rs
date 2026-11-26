@@ -12,7 +12,7 @@ use boxent_proto::{
     AgentError, Capture, ErrorCode, ExecRequest, ExecResult, MAX_CAPTURE, Response,
 };
 
-use super::{Ctx, sys};
+use super::{Ctx, landlock, sys};
 
 /// After the main process exits, keep reading output this long before returning. Background
 /// processes that hold the pipes open would otherwise make every call wait for the timeout.
@@ -107,7 +107,17 @@ fn run_inner(ctx: &Ctx, req: &ExecRequest) -> Result<ExecResult, AgentError> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let ruleset = landlock::ruleset(&ctx.cfg.writable_roots).map_err(|e| {
+        AgentError::new(ErrorCode::Io, format!("building the Landlock ruleset: {e}"))
+    })?;
+    if ruleset.is_none() && ctx.cfg.require_landlock {
+        return Err(AgentError::new(
+            ErrorCode::SpawnFailed,
+            "Landlock is required but unavailable",
+        ));
+    }
     let setup = ChildSetup {
+        landlock_fd: ruleset.as_ref().map_or(-1, AsRawFd::as_raw_fd),
         procs_fd: cg.procs_file().as_raw_fd(),
         uid: ctx.cfg.uid,
         gid: ctx.cfg.gid,
@@ -258,6 +268,7 @@ fn io_err(e: io::Error) -> AgentError {
 /// What the child does between fork and exec.
 #[derive(Clone, Copy)]
 struct ChildSetup {
+    landlock_fd: RawFd,
     procs_fd: RawFd,
     uid: u32,
     gid: u32,
@@ -299,11 +310,19 @@ impl ChildSetup {
             };
             check(libc::setrlimit(libc::RLIMIT_CORE, &no_core))?;
             if libc::getuid() == 0 {
+                // Empty the bounding set so no capability can ever be regained, even by a
+                // setuid-root binary (no_new_privs already blocks that; this is belt and braces).
+                for cap in 0..64 {
+                    libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0);
+                }
                 check(libc::setgroups(0, std::ptr::null()))?;
                 check(libc::setgid(self.gid))?;
                 check(libc::setuid(self.uid))?;
             }
             check(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))?;
+            if self.landlock_fd >= 0 && landlock::restrict_self(self.landlock_fd) < 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
         Ok(())
     }

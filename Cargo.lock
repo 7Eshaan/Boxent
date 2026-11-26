@@ -71,6 +71,8 @@ name = "boxent-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "boxent-driver-oci",
+ "boxent-proto",
  "clap",
  "libc",
  "serde",
@@ -84,6 +86,12 @@ version = "0.1.0"
 [[package]]
 name = "boxent-driver-oci"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "boxent-proto",
+ "libc",
+ "serde_json",
+]
 
 [[package]]
 name = "boxent-egress"

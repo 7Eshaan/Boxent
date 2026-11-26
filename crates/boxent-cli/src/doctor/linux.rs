@@ -30,6 +30,7 @@ pub fn checks(data_dir: &Path) -> Vec<Check> {
         btrfs_pool(data_dir),
         btrfs_quota(data_dir),
         free_space(data_dir),
+        base_image(data_dir),
         tool("crun", "crun", "apt-get install crun"),
         tool("btrfs-progs", "btrfs", "apt-get install btrfs-progs"),
         tool("mmdebstrap", "mmdebstrap", "apt-get install mmdebstrap"),
@@ -332,5 +333,15 @@ fn kvm() -> Check {
             "/dev/kvm missing: fine for now, needed only for the later Firecracker tier",
             "enable nested virtualization (set in the Boxent Lima template on M3 and newer Macs)",
         )
+    }
+}
+
+fn base_image(data_dir: &Path) -> Check {
+    const NAME: &str = "base image";
+    let p = data_dir.join("images/base");
+    if p.join("usr").is_dir() {
+        Check::pass(NAME, format!("{} is built", p.display()))
+    } else {
+        Check::warn(NAME, "not built yet", "boxent image build")
     }
 }

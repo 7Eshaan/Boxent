@@ -108,14 +108,28 @@ fn vm_deploy(debug: bool) -> Result<()> {
 }
 
 /// Test binaries that run inside the VM: package, cargo target selector, target name.
-const VM_TESTS: [(&str, &str, &str); 2] = [
+const VM_TESTS: [(&str, &str, &str); 4] = [
     ("boxent-agent", "--bin", "boxent-agent"),
     ("boxent-agent", "--test", "vm"),
+    ("boxent-driver-oci", "--lib", "boxent_driver_oci"),
+    ("boxent-driver-oci", "--test", "isolation"),
 ];
 const VM_TEST_DIR: &str = "/tmp/boxent-vm-test";
 
 fn vm_test(filter: Option<String>) -> Result<()> {
-    let release = build_linux(false)?;
+    // Installs the current binaries, then makes sure the base image exists (built once, ~90 s).
+    vm_deploy(false)?;
+    run(Command::new("limactl").args([
+        "shell",
+        "--workdir",
+        "/",
+        VM,
+        "sudo",
+        "/usr/local/bin/boxent",
+        "image",
+        "build",
+    ]))?;
+    let release = root().join("target").join(LINUX_TARGET).join("release");
     let mut binaries = Vec::new();
     for (package, selector, target) in VM_TESTS {
         let out = cargo()
@@ -128,7 +142,8 @@ fn vm_test(filter: Option<String>) -> Result<()> {
                 "-p",
                 package,
             ])
-            .args([selector, target])
+            .arg(selector)
+            .args((selector != "--lib").then_some(target))
             .args(["--message-format", "json-render-diagnostics"])
             .stderr(std::process::Stdio::inherit())
             .output()

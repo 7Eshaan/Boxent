@@ -52,6 +52,9 @@ pub struct HelloInfo {
     pub agent_version: String,
     /// The agent's PID as it sees itself (1 inside a sandbox).
     pub pid: u32,
+    /// Landlock ABI applied to commands; 0 when the kernel has none.
+    #[serde(default)]
+    pub landlock_abi: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

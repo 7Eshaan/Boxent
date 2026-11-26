@@ -81,6 +81,7 @@ impl Agent {
             .arg(&ws)
             .arg("--writable-root")
             .arg(&ws)
+            .args(["--writable-root", "/tmp", "--require-landlock"])
             // A secret in the agent's own environment must never reach commands.
             .env("BOXENT_CANARY_SECRET", "canary-7f3a")
             .stdin(Stdio::null());

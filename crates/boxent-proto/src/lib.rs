@@ -8,10 +8,12 @@
 //! allocation, and [`ExecResult::check`] verifies captured output against the requested caps.
 
 mod capture;
+mod client;
 mod frame;
 mod msg;
 
 pub use capture::{Capture, Captured};
+pub use client::{Client, ClientError};
 pub use frame::{FrameError, MAX_FRAME, read_frame, write_frame};
 pub use msg::*;
 
