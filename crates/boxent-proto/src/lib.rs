@@ -14,7 +14,7 @@ mod msg;
 
 pub use capture::{Capture, Captured};
 pub use client::{Client, ClientError};
-pub use frame::{FrameError, MAX_FRAME, read_frame, write_frame};
+pub use frame::{FrameError, MAX_FRAME, decode_body, encode_frame, read_frame, write_frame};
 pub use msg::*;
 
 /// Bumped on any incompatible change to the messages below.

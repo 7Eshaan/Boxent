@@ -7,6 +7,20 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+boxent-proto = { path = "../boxent-proto" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+boxent-driver-oci = { path = "../boxent-driver-oci" }
+libc.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+boxent-driver-oci = { path = "../boxent-driver-oci" }
+libc.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

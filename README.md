@@ -3,15 +3,16 @@
 A local, self-hosted sandbox engine for AI coding agents, served as an MCP server. Each sandbox is a
 disposable, isolated Linux environment with instant snapshot and restore of its workspace.
 
-Status: milestones M0 (development environment), M1 (in-sandbox agent and protocol) and M2 (isolated
-sandboxes with crun) are done. The pool, MCP tools, snapshots and egress arrive in M3 to M7.
+Status: milestones M0 to M3 are done: development environment, in-sandbox agent and protocol,
+isolated sandboxes with crun, and the engine with its warm pool and reaper. The MCP server arrives in
+M4, snapshots in M5, egress in M6.
 
 ## Layout
 
 | Path | What it is |
 | --- | --- |
 | `crates/boxent-cli` | The `boxent` binary: `doctor`, `vm`, `image`, `sandbox`, and later `daemon` and `mcp` |
-| `crates/boxent-core` | Engine API, pool, lifecycle and reaper, CoW storage (M3, M5) |
+| `crates/boxent-core` | Engine: warm pool, claim, exec, file ops, idle and TTL reaping, crash recovery (CoW storage in M5) |
 | `crates/boxent-driver-oci` | Isolation driver: user and network namespaces, idmapped mounts, cgroups, seccomp, crun |
 | `crates/boxent-egress` | Host-side egress proxy (M6) |
 | `crates/boxent-agent` | PID 1 agent inside every sandbox: reaping, commands in per-command cgroups, file access as the sandbox user |
@@ -38,7 +39,8 @@ Inside the VM, as root, `boxent image build` creates the base image (about 90 se
 
 `cargo xtask ci` runs formatting, clippy for macOS and Linux targets, and the unit tests.
 `cargo xtask vm-test [FILTER]` deploys the binaries and runs the kernel-level tests as root inside
-the VM: the agent tests, and isolation suite B against real sandboxes, each followed by a leak check.
+the VM: the agent tests, isolation suite B against real sandboxes, and lifecycle suite C plus the
+latency benchmark against the engine, each test followed by a leak check.
 
 ## Development on Linux
 

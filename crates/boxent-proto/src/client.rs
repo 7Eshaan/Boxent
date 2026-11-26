@@ -49,6 +49,10 @@ impl<S: Read + Write> Client<S> {
         &self.stream
     }
 
+    pub fn into_inner(self) -> S {
+        self.stream
+    }
+
     /// Sends a request and waits for its response. Only one request may be outstanding.
     pub fn call(&mut self, body: Request) -> Result<Response, ClientError> {
         let id = self.next_id;

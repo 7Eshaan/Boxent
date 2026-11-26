@@ -226,6 +226,75 @@ impl OciDriver {
         Ok(())
     }
 
+    /// Removes every sandbox left by a previous engine: crun containers, mounts, storage,
+    /// cgroups and UID slots. Only safe while no engine is running (the engine lock ensures it).
+    pub fn sweep_orphans(&self) -> Result<usize> {
+        let mut ids: Vec<String> = Vec::new();
+        let crun = |args: &[&str]| {
+            Command::new(&self.cfg.crun)
+                .arg("--root")
+                .arg(self.cfg.state_dir.join("crun"))
+                .args(args)
+                .stderr(Stdio::null())
+                .output()
+        };
+        if let Ok(out) = crun(&["list", "-q"]) {
+            for id in String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+            {
+                let _ = crun(&["delete", "--force", id]);
+                ids.push(id.to_owned());
+            }
+        }
+        let names = |dir: &Path| -> Vec<String> {
+            fs::read_dir(dir)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter_map(|e| e.file_name().into_string().ok())
+                        .filter(|n| n.starts_with("sb-"))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let cgroup_parent = Path::new(CGROUP_ROOT).join(&self.cfg.cgroup_parent);
+        for dir in [
+            self.cfg.state_dir.join("sb"),
+            self.cfg.data_dir.join("sb"),
+            cgroup_parent.clone(),
+        ] {
+            ids.extend(names(&dir));
+        }
+        ids.sort();
+        ids.dedup();
+        for id in &ids {
+            let state = self.cfg.state_dir.join("sb").join(id);
+            for m in ["rootfs", "ws", "home", "userns", "netns"] {
+                sys::unmount(&state.join(m));
+            }
+            let _ = fs::remove_dir_all(&state);
+            let storage = self.cfg.data_dir.join("sb").join(id);
+            if let Ok(rd) = fs::read_dir(&storage) {
+                for e in rd.flatten() {
+                    let _ = btrfs::delete_subvolume(&e.path());
+                }
+            }
+            let _ = fs::remove_dir_all(&storage);
+            let cg = cgroup_parent.join(id);
+            if cg.exists() {
+                let _ = write(&cg.join("cgroup.kill"), "1");
+                remove_cgroup_tree(&cg);
+            }
+        }
+        if let Ok(rd) = fs::read_dir(self.cfg.state_dir.join("uid-slots")) {
+            for e in rd.flatten() {
+                let _ = fs::remove_file(e.path());
+            }
+        }
+        Ok(ids.len())
+    }
+
     fn claim_uid_slot(&self) -> Result<u32> {
         let dir = self.cfg.state_dir.join("uid-slots");
         for n in 0..UID_SLOTS {
@@ -273,6 +342,12 @@ impl Sandbox {
 
     pub fn client(&mut self) -> &mut Client<UnixStream> {
         self.client.as_mut().expect("sandbox is running")
+    }
+
+    /// Hands the agent connection to the caller (the engine's async client). The handshake has
+    /// already been done. Afterwards, `destroy` stops the sandbox with crun alone.
+    pub fn take_stream(&mut self) -> Option<UnixStream> {
+        self.client.take().map(Client::into_inner)
     }
 
     /// The agent's PID as the host sees it.

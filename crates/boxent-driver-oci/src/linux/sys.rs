@@ -83,7 +83,11 @@ pub fn create_namespace(
         bind(Path::new(&format!("/proc/{pid}/ns/{ns}")), pin)
     })();
 
-    drop(release_w); // lets the child exit
+    // Release the child with an explicit byte rather than EOF: helper children forked
+    // concurrently by other threads inherit copies of this pipe, so EOF may never come.
+    // SAFETY: writes one byte from a local.
+    unsafe { libc::write(release_w.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
+    drop(release_w);
     let mut st = 0;
     // SAFETY: waits for our own child.
     unsafe { libc::waitpid(pid, &mut st, 0) };

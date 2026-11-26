@@ -45,8 +45,9 @@ impl From<io::Error> for FrameError {
     }
 }
 
-/// Encodes `msg` and writes it as one frame. Refuses messages larger than [`MAX_FRAME`].
-pub fn write_frame<W: Write, T: Serialize>(w: &mut W, msg: &T) -> Result<(), FrameError> {
+/// Encodes `msg` as a complete frame, length prefix included. Refuses messages larger than
+/// [`MAX_FRAME`]. Used directly by async writers.
+pub fn encode_frame<T: Serialize>(msg: &T) -> Result<Vec<u8>, FrameError> {
     let mut buf = Vec::with_capacity(256);
     buf.extend_from_slice(&[0; 4]);
     ciborium::into_writer(msg, &mut buf).map_err(|e| FrameError::Encode(e.to_string()))?;
@@ -58,7 +59,17 @@ pub fn write_frame<W: Write, T: Serialize>(w: &mut W, msg: &T) -> Result<(), Fra
         });
     }
     buf[..4].copy_from_slice(&len.to_be_bytes());
-    w.write_all(&buf)?;
+    Ok(buf)
+}
+
+/// Decodes a frame body (the bytes after the length prefix). Used directly by async readers.
+pub fn decode_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, FrameError> {
+    ciborium::from_reader(body).map_err(|e| FrameError::Decode(e.to_string()))
+}
+
+/// Encodes `msg` and writes it as one frame.
+pub fn write_frame<W: Write, T: Serialize>(w: &mut W, msg: &T) -> Result<(), FrameError> {
+    w.write_all(&encode_frame(msg)?)?;
     w.flush()?;
     Ok(())
 }
@@ -77,7 +88,7 @@ pub fn read_frame<R: Read, T: DeserializeOwned>(r: &mut R, max: u32) -> Result<T
     }
     let mut body = vec![0u8; len as usize];
     r.read_exact(&mut body)?;
-    ciborium::from_reader(body.as_slice()).map_err(|e| FrameError::Decode(e.to_string()))
+    decode_body(&body)
 }
 
 #[cfg(test)]
