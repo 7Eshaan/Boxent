@@ -1,0 +1,12 @@
+[package]
+name = "boxent-egress"
+description = "Boxent host-side egress proxy with per-sandbox allowlist profiles."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

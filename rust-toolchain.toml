@@ -1,0 +1,5 @@
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+# The Lima VM on Apple Silicon is arm64 Linux; binaries for it are static musl builds.
+targets = ["aarch64-unknown-linux-musl"]

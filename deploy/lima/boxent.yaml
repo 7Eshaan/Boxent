@@ -1,0 +1,112 @@
+# Lima template for the Boxent VM, used by `boxent vm up`.
+#
+# Safety settings (checked by `boxent doctor`):
+#   - no host directories are mounted: Lima mounts your home directory by default, which would put
+#     ~/.ssh and cloud credentials one sandbox escape away;
+#   - no guest ports are forwarded except the engine's Unix socket;
+#   - the VM cannot reach services on the Mac's loopback (127.0.0.1), and host proxy settings are
+#     not copied in;
+#   - no host SSH public keys or agent are passed in.
+minimumLimaVersion: 2.0.0
+
+base:
+- template:_images/ubuntu-lts
+
+vmType: vz
+cpus: 4
+memory: 6GiB
+disk: 20GiB
+
+mounts: []
+
+# Lets the later Firecracker tier use KVM inside the VM (Apple M3 and newer).
+nestedVirtualization: true
+
+containerd:
+  system: false
+  user: false
+
+ssh:
+  loadDotSSHPubKeys: false
+  forwardAgent: false
+
+upgradePackages: false
+propagateProxyEnv: false
+
+networkOpts:
+  hostLoopback: false
+
+# The Btrfs pool lives on its own disk, created by `boxent vm up` with `limactl disk create`.
+additionalDisks:
+- name: boxent-data
+  format: false
+  mount: false
+
+portForwards:
+- guestSocket: /run/boxent/boxent.sock
+  hostSocket: "{{.Dir}}/sock/boxent.sock"
+# Everything else stays inside the VM. guestIPMustBeZero: false makes 0.0.0.0 match every guest
+# address (127.0.0.1 and ::1 included); Lima's default is true, which would let loopback ports through.
+- guestIP: 0.0.0.0
+  guestIPMustBeZero: false
+  proto: any
+  ignore: true
+
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    # Runs as root on every boot; every step is idempotent.
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+
+    if ! command -v crun >/dev/null || ! command -v mkfs.btrfs >/dev/null || ! command -v mmdebstrap >/dev/null; then
+      apt-get -o DPkg::Lock::Timeout=300 update -q
+      apt-get -o DPkg::Lock::Timeout=300 install -y -q --no-install-recommends \
+        crun btrfs-progs mmdebstrap
+    fi
+
+    DATA=/var/lib/boxent
+    LABEL=boxent-data
+
+    if ! blkid -L "$LABEL" >/dev/null 2>&1; then
+      # The data disk is the only whole, writable disk with no partitions and no filesystem.
+      candidates=()
+      for dev in $(lsblk -dnpo NAME); do
+        [ "$(lsblk -dno TYPE "$dev")" = disk ] || continue
+        [ "$(lsblk -dno RO "$dev" | tr -d ' ')" = 0 ] || continue
+        [ -z "$(lsblk -dno FSTYPE "$dev" | tr -d ' ')" ] || continue
+        [ "$(lsblk -nro NAME "$dev" | wc -l)" = 1 ] || continue
+        candidates+=("$dev")
+      done
+      if [ "${#candidates[@]}" -ne 1 ]; then
+        echo "boxent: expected exactly one blank data disk, found: ${candidates[*]:-none}" >&2
+        exit 1
+      fi
+      mkfs.btrfs -q -L "$LABEL" "${candidates[0]}"
+    fi
+
+    install -d -m 0700 "$DATA"
+    grep -q "LABEL=$LABEL " /etc/fstab || echo "LABEL=$LABEL $DATA btrfs noatime 0 0" >> /etc/fstab
+    mountpoint -q "$DATA" || mount "$DATA"
+    chmod 0700 "$DATA"
+
+    # Simple quotas: cheap per-subvolume disk accounting (kernel 6.7+).
+    uuid="$(blkid -s UUID -o value "$(blkid -L "$LABEL")")"
+    if [ ! -e "/sys/fs/btrfs/$uuid/qgroups/mode" ]; then
+      btrfs quota enable --simple "$DATA"
+    fi
+
+    install -d -m 0755 /usr/local/lib/boxent /run/boxent
+
+probes:
+- mode: readiness
+  description: Boxent data disk mounted and crun installed
+  script: |
+    #!/bin/bash
+    set -eu
+    if ! timeout 300s bash -c "until mountpoint -q /var/lib/boxent && command -v crun >/dev/null; do sleep 3; done"; then
+      echo >&2 "the Boxent data disk or crun is not ready"
+      exit 1
+    fi
+  hint: See /var/log/cloud-init-output.log and `boxent doctor` inside the VM.

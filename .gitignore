@@ -1,0 +1,18 @@
+# Rust build output
+/target/
+
+# Local runtime state and generated images
+/.boxent/
+*.img
+*.squashfs
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Python test tooling
+__pycache__/
+.pytest_cache/
+.venv/

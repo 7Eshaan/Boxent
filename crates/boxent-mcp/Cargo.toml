@@ -1,0 +1,12 @@
+[package]
+name = "boxent-mcp"
+description = "Boxent MCP layer: tool schemas, session routing, stdio and Streamable HTTP transports."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
