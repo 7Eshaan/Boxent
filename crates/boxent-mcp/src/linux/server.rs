@@ -19,6 +19,8 @@ const INSTRUCTIONS: &str = "Boxent runs code in disposable, isolated Linux sandb
 (Ubuntu with bash, python3, git and curl; no network access). Every tool takes an optional \
 sandbox_id; without one, calls go to this session's default sandbox, created on first use. \
 Files persist between calls in /workspace; each run_bash call starts a fresh shell. \
+Call snapshot before a risky change and restore to rewind /workspace and /home/sandbox \
+instantly if it goes wrong. \
 Sandboxes are destroyed when idle for a while, after a maximum lifetime, or when the session \
 ends; errors then say `sandbox_reaped` and the next call without a sandbox_id starts a new one.";
 
@@ -303,6 +305,123 @@ impl BoxentServer {
             destroyed: true,
         }))
     }
+    /// Take a snapshot of the sandbox's /workspace and /home/sandbox, to rewind to later with `restore`. Snapshots are instant and cheap; take one before any risky change.
+    #[tool(annotations(
+        title = "Snapshot",
+        read_only_hint = false,
+        destructive_hint = false,
+        open_world_hint = false
+    ))]
+    async fn snapshot(
+        &self,
+        Parameters(a): Parameters<SnapshotArgs>,
+    ) -> Result<Json<SnapshotOutput>, CallToolResult> {
+        let id = self.resolve(a.sandbox_id).await?;
+        let info = self
+            .engine
+            .snapshot(&id, a.label)
+            .await
+            .map_err(tool_error)?;
+        let used = self
+            .engine
+            .list_snapshots(&id)
+            .map(|l| l.len())
+            .unwrap_or(0);
+        Ok(Json(SnapshotOutput {
+            sandbox_id: id,
+            snap_id: info.snap_id,
+            label: info.label,
+            created_at: timestamp(info.created_at),
+            snapshots_used: used as u32,
+            snapshots_max: self.engine.config().max_snapshots as u32,
+        }))
+    }
+
+    /// Rewind the sandbox's /workspace and /home/sandbox to a snapshot. Every process in the sandbox is killed first and /tmp is emptied. The snapshot is kept, so it can be restored again.
+    #[tool(annotations(
+        title = "Restore snapshot",
+        read_only_hint = false,
+        destructive_hint = true,
+        idempotent_hint = true,
+        open_world_hint = false
+    ))]
+    async fn restore(
+        &self,
+        Parameters(a): Parameters<RestoreArgs>,
+    ) -> Result<Json<RestoreOutput>, CallToolResult> {
+        let id = self.resolve(a.sandbox_id).await?;
+        let killed = self
+            .engine
+            .restore(&id, &a.snap_id)
+            .await
+            .map_err(tool_error)?;
+        Ok(Json(RestoreOutput {
+            sandbox_id: id,
+            snap_id: a.snap_id,
+            restored: true,
+            processes_killed: killed,
+        }))
+    }
+
+    /// List the sandbox's snapshots, oldest first.
+    #[tool(annotations(
+        title = "List snapshots",
+        read_only_hint = true,
+        open_world_hint = false
+    ))]
+    async fn list_snapshots(
+        &self,
+        Parameters(a): Parameters<ListSnapshotsArgs>,
+    ) -> Result<Json<ListSnapshotsOutput>, CallToolResult> {
+        let id = self.resolve(a.sandbox_id).await?;
+        let snapshots = self
+            .engine
+            .list_snapshots(&id)
+            .map_err(tool_error)?
+            .into_iter()
+            .map(|s| SnapshotEntry {
+                snap_id: s.snap_id,
+                label: s.label,
+                created_at: timestamp(s.created_at),
+            })
+            .collect();
+        Ok(Json(ListSnapshotsOutput {
+            sandbox_id: id,
+            snapshots,
+            snapshots_max: self.engine.config().max_snapshots as u32,
+        }))
+    }
+
+    /// Delete a snapshot to free its slot and the disk space only it holds.
+    #[tool(annotations(
+        title = "Delete snapshot",
+        read_only_hint = false,
+        destructive_hint = true,
+        idempotent_hint = false,
+        open_world_hint = false
+    ))]
+    async fn delete_snapshot(
+        &self,
+        Parameters(a): Parameters<DeleteSnapshotArgs>,
+    ) -> Result<Json<DeleteSnapshotOutput>, CallToolResult> {
+        let id = self.resolve(a.sandbox_id).await?;
+        self.engine
+            .delete_snapshot(&id, &a.snap_id)
+            .await
+            .map_err(tool_error)?;
+        Ok(Json(DeleteSnapshotOutput {
+            sandbox_id: id,
+            snap_id: a.snap_id,
+            deleted: true,
+        }))
+    }
+}
+
+fn timestamp(t: std::time::SystemTime) -> String {
+    rfc3339(
+        t.duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+    )
 }
 
 #[tool_handler(router = self.tool_router)]

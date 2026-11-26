@@ -154,6 +154,106 @@ pub struct DestroySandboxOutput {
     pub destroyed: bool,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotArgs {
+    /// A note to recognise the snapshot by, such as "before refactor". At most 200 characters.
+    #[serde(default)]
+    #[schemars(length(max = 200))]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub sandbox_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SnapshotOutput {
+    pub sandbox_id: String,
+    /// Pass this to `restore` to rewind /workspace and /home/sandbox to this moment.
+    pub snap_id: String,
+    pub label: Option<String>,
+    /// RFC 3339 time, UTC.
+    pub created_at: String,
+    pub snapshots_used: u32,
+    pub snapshots_max: u32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreArgs {
+    /// A snapshot of this sandbox, as returned by `snapshot` or `list_snapshots`.
+    pub snap_id: String,
+    #[serde(default)]
+    pub sandbox_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct RestoreOutput {
+    pub sandbox_id: String,
+    pub snap_id: String,
+    pub restored: bool,
+    /// Processes that were running in the sandbox and were killed by the restore.
+    pub processes_killed: u32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListSnapshotsArgs {
+    #[serde(default)]
+    pub sandbox_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SnapshotEntry {
+    pub snap_id: String,
+    pub label: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ListSnapshotsOutput {
+    pub sandbox_id: String,
+    /// Oldest first.
+    pub snapshots: Vec<SnapshotEntry>,
+    pub snapshots_max: u32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteSnapshotArgs {
+    pub snap_id: String,
+    #[serde(default)]
+    pub sandbox_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DeleteSnapshotOutput {
+    pub sandbox_id: String,
+    pub snap_id: String,
+    pub deleted: bool,
+}
+
+/// Formats seconds since the Unix epoch as RFC 3339 in UTC, e.g. `2026-11-26T12:06:29Z`.
+pub fn rfc3339(unix_secs: u64) -> String {
+    let days = (unix_secs / 86_400) as i64;
+    let rem = unix_secs % 86_400;
+    // Civil-from-days (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
 /// Parses an octal mode string such as "644".
 pub fn parse_mode(s: &str) -> Option<u32> {
     if !(3..=4).contains(&s.len()) {
@@ -180,6 +280,10 @@ mod tests {
             schema::<ReadFileArgs>(),
             schema::<CreateSandboxArgs>(),
             schema::<DestroySandboxArgs>(),
+            schema::<SnapshotArgs>(),
+            schema::<RestoreArgs>(),
+            schema::<ListSnapshotsArgs>(),
+            schema::<DeleteSnapshotArgs>(),
         ] {
             assert_eq!(s["additionalProperties"], json!(false), "{s}");
         }
@@ -208,6 +312,13 @@ mod tests {
         ] {
             assert!(props.contains_key(f), "missing {f}");
         }
+    }
+
+    #[test]
+    fn timestamps() {
+        assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339(1_795_090_589), "2026-11-19T12:16:29Z");
+        assert_eq!(rfc3339(951_782_400), "2000-02-29T00:00:00Z");
     }
 
     #[test]

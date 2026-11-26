@@ -49,6 +49,8 @@ pub struct EngineConfig {
     pub default_timeout: Duration,
     pub max_timeout: Duration,
     pub caps: Caps,
+    /// Snapshots one sandbox may hold at a time.
+    pub max_snapshots: usize,
     /// Sandboxes created in parallel by the refill task.
     pub create_parallelism: usize,
 }
@@ -68,6 +70,7 @@ impl Default for EngineConfig {
             default_timeout: Duration::from_secs(30),
             max_timeout: Duration::from_secs(600),
             caps: Caps::default(),
+            max_snapshots: 32,
             create_parallelism: 2,
         }
     }
@@ -97,6 +100,13 @@ pub struct ExecOutcome {
     pub stdout_total_bytes: u64,
     pub stderr_truncated: bool,
     pub stderr_total_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SnapshotInfo {
+    pub snap_id: String,
+    pub label: Option<String>,
+    pub created_at: std::time::SystemTime,
 }
 
 #[derive(Debug, Clone)]
@@ -135,7 +145,10 @@ struct Warm {
 struct Active {
     id: String,
     conn: AgentConn,
-    sb: Mutex<Option<Sandbox>>,
+    sb: Arc<Mutex<Option<Sandbox>>>,
+    /// Serialises snapshot, restore and snapshot deletion for this sandbox.
+    ops: tokio::sync::Mutex<()>,
+    snapshots: Mutex<Vec<SnapshotInfo>>,
     claimed: Instant,
     expires: Instant,
     last_used: Mutex<Instant>,
@@ -333,7 +346,9 @@ impl Engine {
         let active = Arc::new(Active {
             id: id.clone(),
             conn: w.conn,
-            sb: Mutex::new(Some(w.sb)),
+            sb: Arc::new(Mutex::new(Some(w.sb))),
+            ops: tokio::sync::Mutex::new(()),
+            snapshots: Mutex::new(Vec::new()),
             claimed: now,
             expires: now + self.inner.cfg.ttl,
             last_used: Mutex::new(now),
@@ -522,6 +537,137 @@ impl Engine {
         }
     }
 
+    /// Takes a point-in-time snapshot of the sandbox's workspace and home.
+    pub async fn snapshot(
+        &self,
+        id: &str,
+        label: Option<String>,
+    ) -> Result<SnapshotInfo, EngineError> {
+        let a = self.lookup(id)?;
+        let _busy = Busy::new(&a);
+        let _op = a.ops.lock().await;
+        let max = self.inner.cfg.max_snapshots;
+        if lock(&a.snapshots).len() >= max {
+            return Err(EngineError::new(
+                ErrorCode::SnapshotLimit,
+                format!("sandbox {id} already has {max} snapshots; delete one first"),
+            ));
+        }
+        let snap_id = new_snap_id()?;
+        let started = Instant::now();
+        let sb = Arc::clone(&a.sb);
+        let sid = snap_id.clone();
+        tokio::task::spawn_blocking(move || match lock(&sb).as_ref() {
+            Some(s) => s.snapshot(&sid).map_err(|e| format!("{e:#}")),
+            None => Err("the sandbox was reaped".into()),
+        })
+        .await
+        .map_err(EngineError::internal)?
+        .map_err(|e| EngineError::internal(format!("snapshot failed: {e}")))?;
+        let info = SnapshotInfo {
+            snap_id,
+            label,
+            created_at: std::time::SystemTime::now(),
+        };
+        lock(&a.snapshots).push(info.clone());
+        tracing::info!(
+            event = "snapshot_created",
+            sandbox_id = %a.id,
+            snap_id = %info.snap_id,
+            op_ms = started.elapsed().as_secs_f64() * 1000.0
+        );
+        Ok(info)
+    }
+
+    /// Rewinds the workspace and home to a snapshot. Every process in the sandbox is killed
+    /// first, and /tmp and /dev/shm are emptied. Returns how many processes were killed.
+    pub async fn restore(&self, id: &str, snap_id: &str) -> Result<u32, EngineError> {
+        let a = self.lookup(id)?;
+        let _busy = Busy::new(&a);
+        let _op = a.ops.lock().await;
+        if !lock(&a.snapshots).iter().any(|s| s.snap_id == snap_id) {
+            return Err(snapshot_not_found(id, snap_id));
+        }
+        let started = Instant::now();
+        let killed = match self
+            .agent_call(&a, Request::KillAll, CONTROL_DEADLINE)
+            .await?
+        {
+            Response::KillAll { processes_killed } => processes_killed,
+            other => {
+                return Err(self
+                    .agent_violation(&a, format!("unexpected reply {other:?}"))
+                    .await);
+            }
+        };
+        let sb = Arc::clone(&a.sb);
+        let sid = snap_id.to_owned();
+        let swapped = tokio::task::spawn_blocking(move || match lock(&sb).as_mut() {
+            Some(s) => s.restore(&sid).map_err(|e| format!("{e:#}")),
+            None => Err("the sandbox was reaped".into()),
+        })
+        .await
+        .map_err(EngineError::internal)?;
+        if let Err(e) = swapped {
+            tracing::error!(event = "restore_failed", sandbox_id = %a.id, snap_id, error = %e);
+            self.reap(&a.id, ReapReason::RestoreFailed).await;
+            return Err(EngineError::internal(format!(
+                "restore failed ({e}); sandbox {id} was destroyed because its files may be half restored"
+            )));
+        }
+        let wipe = ExecRequest {
+            argv: vec![
+                "/usr/bin/find".into(),
+                "/tmp".into(),
+                "/dev/shm".into(),
+                "-mindepth".into(),
+                "1".into(),
+                "-delete".into(),
+            ],
+            env: default_env(),
+            cwd: "/".into(),
+            timeout_ms: 10_000,
+            head_cap: 1024,
+            tail_cap: 1024,
+        };
+        self.agent_call(&a, Request::Exec(wipe), Duration::from_secs(12))
+            .await?;
+        tracing::info!(
+            event = "snapshot_restored",
+            sandbox_id = %a.id,
+            snap_id,
+            processes_killed = killed,
+            op_ms = started.elapsed().as_secs_f64() * 1000.0
+        );
+        Ok(killed)
+    }
+
+    pub fn list_snapshots(&self, id: &str) -> Result<Vec<SnapshotInfo>, EngineError> {
+        let a = self.lookup(id)?;
+        Ok(lock(&a.snapshots).clone())
+    }
+
+    pub async fn delete_snapshot(&self, id: &str, snap_id: &str) -> Result<(), EngineError> {
+        let a = self.lookup(id)?;
+        let _busy = Busy::new(&a);
+        let _op = a.ops.lock().await;
+        let pos = lock(&a.snapshots)
+            .iter()
+            .position(|s| s.snap_id == snap_id)
+            .ok_or_else(|| snapshot_not_found(id, snap_id))?;
+        let sb = Arc::clone(&a.sb);
+        let sid = snap_id.to_owned();
+        tokio::task::spawn_blocking(move || match lock(&sb).as_ref() {
+            Some(s) => s.delete_snapshot(&sid).map_err(|e| format!("{e:#}")),
+            None => Err("the sandbox was reaped".into()),
+        })
+        .await
+        .map_err(EngineError::internal)?
+        .map_err(|e| EngineError::internal(format!("deleting the snapshot failed: {e}")))?;
+        lock(&a.snapshots).remove(pos);
+        Ok(())
+    }
+
     /// Destroys a claimed sandbox and everything it holds.
     pub async fn destroy(&self, id: &str) -> Result<(), EngineError> {
         if self.reap(id, ReapReason::Destroyed).await {
@@ -649,6 +795,35 @@ impl Drop for Busy<'_> {
         *self.0.last_used.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
         self.0.inflight.fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn snapshot_not_found(id: &str, snap_id: &str) -> EngineError {
+    EngineError::new(
+        ErrorCode::SnapshotNotFound,
+        format!("sandbox {id} has no snapshot {snap_id}"),
+    )
+}
+
+/// `snap_` followed by 128 random bits in lowercase base32 (26 characters).
+fn new_snap_id() -> Result<String, EngineError> {
+    let mut b = [0u8; 16];
+    // SAFETY: fills the buffer with random bytes.
+    let n = unsafe { libc::getrandom(b.as_mut_ptr().cast(), b.len(), 0) };
+    if n != b.len() as isize {
+        return Err(EngineError::internal(std::io::Error::last_os_error()));
+    }
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut bits: u128 = u128::from_be_bytes(b);
+    let mut out = String::from("snap_");
+    for _ in 0..26 {
+        out.push(ALPHABET[(bits & 31) as usize] as char);
+        bits >>= 5;
+    }
+    Ok(out)
 }
 
 fn reaped_or_missing(st: &State, id: &str) -> EngineError {

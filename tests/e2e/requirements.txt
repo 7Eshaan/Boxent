@@ -3,3 +3,4 @@ mcp==2.3.0
 pytest==9.*
 pytest-asyncio==1.*
 jsonschema==4.*
+hypothesis==6.*

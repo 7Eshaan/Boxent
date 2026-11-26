@@ -11,7 +11,8 @@ from mcp.shared.exceptions import MCPError
 
 from conftest import BOXENT, call, ok, open_session
 
-TOOLS = {"run_bash", "run_python", "write_file", "read_file", "create_sandbox", "destroy_sandbox"}
+TOOLS = {"run_bash", "run_python", "write_file", "read_file", "create_sandbox", "destroy_sandbox",
+         "snapshot", "restore", "list_snapshots", "delete_snapshot"}
 
 
 async def test_e1_tools_have_strict_input_and_output_schemas():
@@ -35,6 +36,14 @@ async def _test_e1_tools_have_strict_input_and_output_schemas(session):
     jsonschema.validate(out, tools["write_file"].output_schema)
     out = await ok(session, "read_file", path="a.txt")
     jsonschema.validate(out, tools["read_file"].output_schema)
+    snap = await ok(session, "snapshot", label="e1")
+    jsonschema.validate(snap, tools["snapshot"].output_schema)
+    out = await ok(session, "list_snapshots")
+    jsonschema.validate(out, tools["list_snapshots"].output_schema)
+    out = await ok(session, "restore", snap_id=snap["snap_id"])
+    jsonschema.validate(out, tools["restore"].output_schema)
+    out = await ok(session, "delete_snapshot", snap_id=snap["snap_id"])
+    jsonschema.validate(out, tools["delete_snapshot"].output_schema)
 
 
 def test_e2_stdout_carries_only_json_rpc():
@@ -92,6 +101,8 @@ async def _test_e3_errors_are_structured(session):
     assert is_err and err["code"] == "not_found"
     err, is_err = await call(session, "create_sandbox", profile="gpu")
     assert is_err and err["code"] == "invalid_argument"
+    err, is_err = await call(session, "restore", snap_id="snap_nope")
+    assert is_err and err["code"] == "snapshot_not_found"
 
 
 async def test_e4_huge_and_binary_output_is_capped_and_valid():

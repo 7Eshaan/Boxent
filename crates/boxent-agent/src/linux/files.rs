@@ -207,7 +207,8 @@ fn map_err(e: io::Error, path: &Path) -> AgentError {
         Some(libc::EACCES | libc::EPERM | libc::EROFS) => ErrorCode::PermissionDenied,
         Some(libc::EXDEV | libc::ELOOP) => ErrorCode::InvalidPath,
         Some(libc::EISDIR | libc::ENOTDIR | libc::EEXIST) => ErrorCode::WrongType,
-        Some(libc::EFBIG | libc::ENOSPC | libc::EDQUOT) => ErrorCode::TooLarge,
+        Some(libc::EFBIG) => ErrorCode::TooLarge,
+        Some(libc::ENOSPC | libc::EDQUOT) => ErrorCode::NoSpace,
         _ => ErrorCode::Io,
     };
     AgentError::new(code, format!("{}: {e}", path.display()))

@@ -46,6 +46,8 @@ pub struct Limits {
     pub shm_bytes: u64,
     /// Open files per command.
     pub nofile: u32,
+    /// Disk budget for the workspace, home and every snapshot together.
+    pub disk_bytes: u64,
 }
 
 impl Default for Limits {
@@ -57,6 +59,7 @@ impl Default for Limits {
             tmp_bytes: 64 << 20,
             shm_bytes: 64 << 20,
             nofile: 1024,
+            disk_bytes: 2 << 30,
         }
     }
 }

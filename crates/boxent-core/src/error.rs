@@ -19,6 +19,11 @@ pub enum ErrorCode {
     SpawnFailed,
     /// The agent stopped answering or broke the protocol; the sandbox was reaped.
     AgentFailed,
+    /// The sandbox's disk budget (workspace, home and snapshots together) is used up.
+    QuotaExceeded,
+    SnapshotNotFound,
+    /// The sandbox already has the maximum number of snapshots; delete one first.
+    SnapshotLimit,
     Internal,
 }
 
@@ -35,6 +40,9 @@ impl ErrorCode {
             Self::FileTooLarge => "file_too_large",
             Self::SpawnFailed => "spawn_failed",
             Self::AgentFailed => "agent_failed",
+            Self::QuotaExceeded => "quota_exceeded",
+            Self::SnapshotNotFound => "snapshot_not_found",
+            Self::SnapshotLimit => "snapshot_limit",
             Self::Internal => "internal",
         }
     }
@@ -50,6 +58,8 @@ pub enum ReapReason {
     /// Warm sandbox past its maximum age, or unhealthy before being claimed.
     Retired,
     Shutdown,
+    /// A restore failed halfway; the sandbox's files were in an unknown state.
+    RestoreFailed,
 }
 
 impl ReapReason {
@@ -61,6 +71,7 @@ impl ReapReason {
             Self::AgentFailed => "agent_failed",
             Self::Retired => "retired",
             Self::Shutdown => "shutdown",
+            Self::RestoreFailed => "restore_failed",
         }
     }
 }
@@ -102,6 +113,7 @@ impl From<boxent_proto::AgentError> for EngineError {
             A::PermissionDenied => ErrorCode::PermissionDenied,
             A::TooLarge => ErrorCode::FileTooLarge,
             A::SpawnFailed => ErrorCode::SpawnFailed,
+            A::NoSpace => ErrorCode::QuotaExceeded,
             A::Io => ErrorCode::Internal,
         };
         Self::new(code, e.message)

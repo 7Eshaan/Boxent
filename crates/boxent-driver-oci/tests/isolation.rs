@@ -112,6 +112,21 @@ fn assert_clean(d: &OciDriver, id: &str) {
     assert!(!cg.exists(), "cgroup left: {}", cg.display());
     let mounts = fs::read_to_string("/proc/self/mountinfo").unwrap();
     assert!(!mounts.contains(id), "mounts left for {id}");
+    let qgroups = std::process::Command::new("btrfs")
+        .args(["qgroup", "show", "--raw"])
+        .arg(&cfg.data_dir)
+        .output()
+        .unwrap();
+    let live_qgroups = String::from_utf8_lossy(&qgroups.stdout)
+        .lines()
+        .filter(|l| l.starts_with("1/"))
+        .count();
+    let retired = fs::read_to_string(cfg.data_dir.join(".retired-qgroups")).unwrap_or_default();
+    assert!(
+        live_qgroups <= retired.lines().count(),
+        "{live_qgroups} sandbox qgroups exist but only {} are retired",
+        retired.lines().count()
+    );
     let slots = fs::read_dir(cfg.state_dir.join("uid-slots"))
         .unwrap()
         .count();
@@ -557,4 +572,45 @@ fn sandbox_lifecycle_timing() {
         create[10], create[19], destroy[10], destroy[19]
     );
     assert!(create[19] < Duration::from_secs(2));
+}
+
+#[test]
+fn restore_swaps_the_workspace_inside_the_running_sandbox() {
+    if !enabled() {
+        return;
+    }
+    with_sandbox(Limits::default(), |sb| {
+        ok(
+            sb,
+            "echo v1 > /workspace/f; mkdir -p /home/sandbox/.cfg; echo h1 > /home/sandbox/.cfg/x",
+        );
+        sb.snapshot("snap_a1").unwrap();
+        ok(
+            sb,
+            "echo v2 > /workspace/f; rm -r /home/sandbox/.cfg; touch /workspace/new",
+        );
+        match sb.client().call(Request::KillAll).unwrap() {
+            Response::KillAll { .. } => {}
+            other => panic!("{other:?}"),
+        }
+        sb.restore("snap_a1").unwrap();
+        assert_eq!(
+            ok(sb, "cat /workspace/f /home/sandbox/.cfg/x; ls /workspace"),
+            "v1\nh1\nf"
+        );
+        assert_eq!(ok(sb, "stat -c %U /workspace/f"), "sandbox");
+        // The new mounts are writable by the user and covered by Landlock's writable roots.
+        assert_eq!(
+            ok(
+                sb,
+                "echo v3 > /workspace/f && cat /workspace/f && touch /home/sandbox/y && echo ok"
+            ),
+            "v3\nok"
+        );
+        // The snapshot itself is untouched and can be restored again.
+        sb.restore("snap_a1").unwrap();
+        assert_eq!(ok(sb, "cat /workspace/f"), "v1");
+        assert!(sb.restore("snap_missing").is_err());
+        assert!(sb.snapshot("../evil").is_err());
+    });
 }

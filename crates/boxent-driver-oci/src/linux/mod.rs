@@ -91,6 +91,9 @@ impl OciDriver {
             slots_dir: self.cfg.state_dir.join("uid-slots"),
             crun: self.cfg.crun.clone(),
             crun_root: self.cfg.state_dir.join("crun"),
+            data_dir: self.cfg.data_dir.clone(),
+            qgroup: None,
+            agent_pid: 0,
             destroyed: false,
         };
         self.setup(&mut sb, limits)
@@ -124,9 +127,13 @@ impl OciDriver {
         })
         .context("creating the network namespace")?;
 
-        fs::create_dir_all(&sb.storage)?;
+        fs::create_dir_all(sb.storage.join("snaps"))?;
+        let qgroup = btrfs::next_qgroup(&self.cfg.data_dir)?;
+        btrfs::create_budget(&self.cfg.data_dir, &qgroup, limits.disk_bytes)
+            .context("creating the disk budget")?;
+        sb.qgroup = Some(qgroup.clone());
         let live = sb.storage.join("live");
-        btrfs::create_subvolume(&live)?;
+        btrfs::create_subvolume_in(&live, &qgroup)?;
         for d in ["workspace", "home"] {
             let p = live.join(d);
             fs::create_dir(&p)?;
@@ -223,6 +230,7 @@ impl OciDriver {
         }
         client.get_ref().set_read_timeout(None)?;
         sb.client = Some(client);
+        sb.agent_pid = sb.host_pid()?;
         Ok(())
     }
 
@@ -275,18 +283,18 @@ impl OciDriver {
             }
             let _ = fs::remove_dir_all(&state);
             let storage = self.cfg.data_dir.join("sb").join(id);
-            if let Ok(rd) = fs::read_dir(&storage) {
-                for e in rd.flatten() {
-                    let _ = btrfs::delete_subvolume(&e.path());
-                }
-            }
-            let _ = fs::remove_dir_all(&storage);
+            let _ = remove_storage(&self.cfg.data_dir, &storage, None);
             let cg = cgroup_parent.join(id);
             if cg.exists() {
                 let _ = write(&cg.join("cgroup.kill"), "1");
                 remove_cgroup_tree(&cg);
             }
         }
+        // Every sandbox budget is ours, and no sandbox is alive: retire them all.
+        for q in btrfs::level1_qgroups(&self.cfg.data_dir) {
+            let _ = btrfs::retire_budget(&self.cfg.data_dir, &q);
+        }
+        btrfs::gc_budgets(&self.cfg.data_dir);
         if let Ok(rd) = fs::read_dir(self.cfg.state_dir.join("uid-slots")) {
             for e in rd.flatten() {
                 let _ = fs::remove_file(e.path());
@@ -323,7 +331,22 @@ pub struct Sandbox {
     slots_dir: PathBuf,
     crun: PathBuf,
     crun_root: PathBuf,
+    data_dir: PathBuf,
+    /// This sandbox's level-1 qgroup (disk budget).
+    qgroup: Option<String>,
+    /// The agent's PID on the host, used to enter the sandbox's mount namespace.
+    agent_pid: u32,
     destroyed: bool,
+}
+
+/// Snapshot ids reach the filesystem as directory names: only this shape is accepted.
+fn valid_snap_id(id: &str) -> bool {
+    id.len() <= 64
+        && id.starts_with("snap_")
+        && id[5..]
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && id.len() > 5
 }
 
 impl Sandbox {
@@ -365,6 +388,98 @@ impl Sandbox {
             .context("crun state has no pid")
     }
 
+    /// Takes a read-only snapshot of the workspace and home as one point in time: the sandbox's
+    /// processes are frozen for the few milliseconds it takes, so no write is half done.
+    pub fn snapshot(&self, snap_id: &str) -> Result<()> {
+        if !valid_snap_id(snap_id) {
+            bail!("invalid snapshot id {snap_id:?}");
+        }
+        let qgroup = self
+            .qgroup
+            .as_deref()
+            .context("sandbox has no disk budget")?;
+        let dst = self.storage.join("snaps").join(snap_id);
+        if dst.exists() {
+            bail!("snapshot {snap_id} already exists");
+        }
+        self.freeze(true)?;
+        let result = btrfs::snapshot(&self.storage.join("live"), &dst, true, qgroup);
+        self.freeze(false)?;
+        result
+    }
+
+    /// Rewinds the workspace and home to a snapshot, inside the running sandbox. The caller must
+    /// have killed the sandbox's user processes first: they would keep the old files open.
+    ///
+    /// A writable copy of the snapshot is mounted over /workspace and /home/sandbox in the
+    /// sandbox's own mount namespace; the snapshot itself stays read-only, so it can be restored
+    /// again later.
+    pub fn restore(&mut self, snap_id: &str) -> Result<()> {
+        if !valid_snap_id(snap_id) {
+            bail!("invalid snapshot id {snap_id:?}");
+        }
+        let qgroup = self.qgroup.clone().context("sandbox has no disk budget")?;
+        let snap = self.storage.join("snaps").join(snap_id);
+        if !snap.is_dir() {
+            bail!("snapshot {snap_id} does not exist");
+        }
+        let next = self.storage.join("live.next");
+        if next.exists() {
+            btrfs::delete_subvolume(&next)?;
+        }
+        btrfs::snapshot(&snap, &next, false, &qgroup)?;
+        let userns = File::open(self.state.join("userns"))?;
+        let mounts = [
+            (
+                sys::idmapped_tree(&next.join("workspace"), userns.as_fd(), false)?,
+                spec::WORKSPACE,
+            ),
+            (
+                sys::idmapped_tree(&next.join("home"), userns.as_fd(), false)?,
+                spec::HOME,
+            ),
+        ];
+        sys::inject_mounts(self.agent_pid, &mounts).context("swapping the workspace mounts")?;
+        // The old live subvolume is no longer mounted in the sandbox; release the host-side
+        // mounts crun bound from, then replace it.
+        sys::unmount(&self.state.join("ws"));
+        sys::unmount(&self.state.join("home"));
+        let live = self.storage.join("live");
+        btrfs::delete_subvolume(&live)?;
+        fs::rename(&next, &live)?;
+        Ok(())
+    }
+
+    pub fn delete_snapshot(&self, snap_id: &str) -> Result<()> {
+        if !valid_snap_id(snap_id) {
+            bail!("invalid snapshot id {snap_id:?}");
+        }
+        btrfs::delete_subvolume(&self.storage.join("snaps").join(snap_id))
+    }
+
+    fn freeze(&self, on: bool) -> Result<()> {
+        write(
+            &self.cgroup.join("cgroup.freeze"),
+            if on { "1" } else { "0" },
+        )?;
+        let want = if on { "frozen 1" } else { "frozen 0" };
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let events = fs::read_to_string(self.cgroup.join("cgroup.events"))?;
+            if events.lines().any(|l| l.trim() == want) {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = write(&self.cgroup.join("cgroup.freeze"), "0");
+                bail!(
+                    "the sandbox did not {} within 2 s",
+                    if on { "freeze" } else { "thaw" }
+                );
+            }
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    }
+
     /// Stops the sandbox and removes everything it used. Also runs on drop.
     pub fn destroy(mut self) -> Result<()> {
         self.teardown()
@@ -390,13 +505,9 @@ impl Sandbox {
             sys::unmount(&self.state.join(m));
         }
         let mut errors = Vec::new();
-        let live = self.storage.join("live");
-        if live.exists()
-            && let Err(e) = btrfs::delete_subvolume(&live)
-        {
+        if let Err(e) = remove_storage(&self.data_dir, &self.storage, self.qgroup.as_deref()) {
             errors.push(format!("{e:#}"));
         }
-        let _ = fs::remove_dir(&self.storage);
         if self.cgroup.exists() {
             let _ = write(&self.cgroup.join("cgroup.kill"), "1");
             remove_cgroup_tree(&self.cgroup);
@@ -419,6 +530,31 @@ impl Drop for Sandbox {
             eprintln!("{e:#}");
         }
     }
+}
+
+/// Deletes a sandbox's subvolumes (live, a half-made restore, every snapshot) and retires its
+/// disk budget, which is dropped once Btrfs has cleaned the subvolumes up.
+fn remove_storage(data_dir: &Path, storage: &Path, qgroup: Option<&str>) -> Result<()> {
+    let mut subvolumes: Vec<PathBuf> = ["live", "live.next"]
+        .iter()
+        .map(|n| storage.join(n))
+        .collect();
+    if let Ok(rd) = fs::read_dir(storage.join("snaps")) {
+        subvolumes.extend(rd.flatten().map(|e| e.path()));
+    }
+    let mut first_error = None;
+    for sv in subvolumes.iter().filter(|p| p.exists()) {
+        if let Err(e) = btrfs::delete_subvolume(sv) {
+            first_error.get_or_insert(e);
+        }
+    }
+    let _ = fs::remove_dir(storage.join("snaps"));
+    let _ = fs::remove_dir(storage);
+    if let Some(q) = qgroup {
+        btrfs::retire_budget(data_dir, q)?;
+    }
+    btrfs::gc_budgets(data_dir);
+    first_error.map_or(Ok(()), Err)
 }
 
 fn remove_cgroup_tree(dir: &Path) {

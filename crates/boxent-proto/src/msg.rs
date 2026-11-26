@@ -165,6 +165,8 @@ pub enum ErrorCode {
     WrongType,
     /// The program could not be started (not found, not executable).
     SpawnFailed,
+    /// The disk budget or filesystem is full.
+    NoSpace,
     Io,
 }
 

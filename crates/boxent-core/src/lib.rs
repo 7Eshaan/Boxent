@@ -22,4 +22,6 @@ pub use error::{EngineError, ErrorCode, ReapReason};
 mod linux;
 
 #[cfg(target_os = "linux")]
-pub use linux::{Engine, EngineConfig, ExecOutcome, ExecSpec, PoolStats, SandboxInfo};
+pub use linux::{
+    Engine, EngineConfig, ExecOutcome, ExecSpec, PoolStats, SandboxInfo, SnapshotInfo,
+};

@@ -177,15 +177,10 @@ const MOUNT_ATTR_NODEV: u64 = 0x4;
 const MOUNT_ATTR_IDMAP: u64 = 0x0010_0000;
 const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x4;
 
-/// Bind-mounts `src` at `dst` through the ID mapping of `userns`: files owned by UID n on disk
-/// show up as UID n inside that user namespace, whatever host range it maps to.
-pub fn idmapped_bind(
-    src: &Path,
-    dst: &Path,
-    userns: BorrowedFd<'_>,
-    readonly: bool,
-) -> io::Result<()> {
-    let (s, d) = (cpath(src)?, cpath(dst)?);
+/// A detached clone of the mount at `src`, seen through the ID mapping of `userns`: files owned
+/// by UID n on disk show up as UID n inside that user namespace, whatever host range it maps to.
+pub fn idmapped_tree(src: &Path, userns: BorrowedFd<'_>, readonly: bool) -> io::Result<OwnedFd> {
+    let s = cpath(src)?;
     let empty = c"";
     // SAFETY: new-mount-API syscalls with valid, NUL-terminated paths and a correctly sized attr.
     unsafe {
@@ -213,14 +208,99 @@ pub fn idmapped_bind(
             &raw const attr,
             std::mem::size_of::<MountAttr>(),
         ))?;
-        cvt(libc::syscall(
+        Ok(tree)
+    }
+}
+
+fn move_tree(tree: &OwnedFd, dst: &std::ffi::CStr) -> libc::c_long {
+    // SAFETY: attaches a detached mount at a NUL-terminated path.
+    unsafe {
+        libc::syscall(
             libc::SYS_move_mount,
             tree.as_raw_fd(),
-            empty.as_ptr(),
+            c"".as_ptr(),
             libc::AT_FDCWD,
-            d.as_ptr(),
+            dst.as_ptr(),
             MOVE_MOUNT_F_EMPTY_PATH,
-        ))?;
+        )
+    }
+}
+
+/// Bind-mounts `src` at `dst` (on the host) through the ID mapping of `userns`.
+pub fn idmapped_bind(
+    src: &Path,
+    dst: &Path,
+    userns: BorrowedFd<'_>,
+    readonly: bool,
+) -> io::Result<()> {
+    let tree = idmapped_tree(src, userns, readonly)?;
+    cvt(move_tree(&tree, &cpath(dst)?)).map(drop)
+}
+
+/// Replaces mounts inside a running sandbox: for each `(tree, path)`, whatever is mounted at
+/// `path` in the sandbox is detached and `tree` is attached there instead.
+///
+/// Joining a mount namespace requires a single-threaded process, so a forked child does it: it
+/// enters the namespace of `pid` (the sandbox's PID 1), takes that process's root, and moves the
+/// trees, which were prepared in this process. Paths are inside the sandbox.
+pub fn inject_mounts(pid: u32, mounts: &[(OwnedFd, &str)]) -> io::Result<()> {
+    let mnt_ns = std::fs::File::open(format!("/proc/{pid}/ns/mnt"))?;
+    let root = std::fs::File::open(format!("/proc/{pid}/root"))?;
+    let targets: Vec<std::ffi::CString> = mounts
+        .iter()
+        .map(|(_, p)| std::ffi::CString::new(*p).map_err(io::Error::other))
+        .collect::<io::Result<_>>()?;
+    let mut status = [0 as RawFd; 2];
+    // SAFETY: pipe2 fills the array with new descriptors.
+    unsafe { cvt(libc::pipe2(status.as_mut_ptr(), libc::O_CLOEXEC).into())? };
+    let [status_r, status_w] = status.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
+
+    // SAFETY: the child makes only async-signal-safe syscalls on prepared data, then _exit.
+    let pid_child = unsafe { libc::fork() };
+    if pid_child < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if pid_child == 0 {
+        // SAFETY: as above; every value used here was prepared before fork.
+        unsafe {
+            libc::close(status_r.as_raw_fd());
+            let fail = |step: i32| -> ! {
+                let report = [step, *libc::__errno_location()];
+                libc::write(status_w.as_raw_fd(), report.as_ptr().cast(), 8);
+                libc::_exit(1)
+            };
+            if libc::setns(mnt_ns.as_raw_fd(), libc::CLONE_NEWNS) != 0 {
+                fail(1);
+            }
+            if libc::fchdir(root.as_raw_fd()) != 0 || libc::chroot(c".".as_ptr()) != 0 {
+                fail(2);
+            }
+            for (i, (tree, _)) in mounts.iter().enumerate() {
+                let target = &targets[i];
+                libc::umount2(target.as_ptr(), libc::MNT_DETACH);
+                if move_tree(tree, target) != 0 {
+                    fail(10 + i as i32);
+                }
+            }
+            libc::_exit(0)
+        }
+    }
+    drop(status_w);
+    let mut report = [0i32; 2];
+    // SAFETY: reads up to 8 bytes into a local array.
+    let n = unsafe { libc::read(status_r.as_raw_fd(), report.as_mut_ptr().cast(), 8) };
+    let mut st = 0;
+    // SAFETY: waits for our own child.
+    unsafe { libc::waitpid(pid_child, &mut st, 0) };
+    if n == 8 {
+        return Err(io::Error::other(format!(
+            "mount injection failed at step {}: {}",
+            report[0],
+            io::Error::from_raw_os_error(report[1])
+        )));
+    }
+    if !(libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0) {
+        return Err(io::Error::other("mount injection helper died"));
     }
     Ok(())
 }

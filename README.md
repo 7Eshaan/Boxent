@@ -3,9 +3,9 @@
 A local, self-hosted sandbox engine for AI coding agents, served as an MCP server. Each sandbox is a
 disposable, isolated Linux environment with instant snapshot and restore of its workspace.
 
-Status: milestones M0 to M4 are done: development environment, in-sandbox agent and protocol,
-isolated sandboxes with crun, the engine with its warm pool and reaper, and the MCP server.
-Snapshots arrive in M5, egress in M6, Streamable HTTP in M7.
+Status: milestones M0 to M5 are done: development environment, in-sandbox agent and protocol,
+isolated sandboxes with crun, the engine with its warm pool and reaper, the MCP server, and
+snapshot/restore. Egress allowlists arrive in M6, Streamable HTTP and hardening in M7.
 
 ## Use it from an MCP client
 
@@ -22,7 +22,11 @@ Then register it with your client, for example in a project's `.mcp.json`:
 { "mcpServers": { "boxent": { "command": "/Users/you/.cargo/bin/boxent", "args": ["mcp"] } } }
 ```
 
-Tools: `run_bash`, `run_python`, `write_file`, `read_file`, `create_sandbox`, `destroy_sandbox`.
+Tools: `run_bash`, `run_python`, `write_file`, `read_file`, `create_sandbox`, `destroy_sandbox`,
+`snapshot`, `restore`, `list_snapshots`, `delete_snapshot`. A snapshot captures `/workspace` and
+`/home/sandbox` at one instant (a read-only Btrfs snapshot, about 2 ms); `restore` rewinds them in
+the running sandbox, after killing its processes. Each sandbox has a 2 GiB disk budget that covers
+its files and all its snapshots, and holds up to 32 snapshots.
 Calls without a `sandbox_id` share one sandbox per session, created on first use and destroyed 30
 seconds after the session ends.
 
@@ -31,7 +35,7 @@ seconds after the session ends.
 | Path | What it is |
 | --- | --- |
 | `crates/boxent-cli` | The `boxent` binary: `doctor`, `vm`, `image`, `sandbox`, and later `daemon` and `mcp` |
-| `crates/boxent-core` | Engine: warm pool, claim, exec, file ops, idle and TTL reaping, crash recovery (CoW storage in M5) |
+| `crates/boxent-core` | Engine: warm pool, claim, exec, file ops, snapshots, idle and TTL reaping, crash recovery |
 | `crates/boxent-driver-oci` | Isolation driver: user and network namespaces, idmapped mounts, cgroups, seccomp, crun |
 | `crates/boxent-egress` | Host-side egress proxy (M6) |
 | `crates/boxent-agent` | PID 1 agent inside every sandbox: reaping, commands in per-command cgroups, file access as the sandbox user |
@@ -61,9 +65,11 @@ Inside the VM, as root, `boxent image build` creates the base image (about 90 se
 `cargo xtask ci` runs formatting, clippy for macOS and Linux targets, and the unit tests.
 `cargo xtask vm-test [FILTER]` deploys the binaries and runs the kernel-level tests as root inside
 the VM: the agent tests, isolation suite B against real sandboxes, and lifecycle suite C plus the
-latency benchmark against the engine, and MCP session tests, each followed by a leak check.
+latency benchmark against the engine, snapshot suite D, and MCP session tests, each followed by a
+leak check.
 `cargo xtask e2e` runs the black-box MCP suite from the Mac, through the relay and Lima's socket
-forwarding, using a local `.venv` with the official Python MCP SDK.
+forwarding, using a local `.venv` with the official Python MCP SDK; it includes a Hypothesis
+model-based test of snapshot and restore (500 random sequences, about 2 minutes).
 
 ## Development on Linux
 
