@@ -10,10 +10,13 @@ pub mod schema;
 #[cfg(target_os = "linux")]
 mod linux {
     pub mod daemon;
+    pub mod http;
     pub mod server;
 }
 
 #[cfg(target_os = "linux")]
 pub use linux::daemon::{DaemonOptions, run as run_daemon, serve_connection};
+#[cfg(target_os = "linux")]
+pub use linux::http::{HttpOptions, serve_http, serve_http_on};
 #[cfg(target_os = "linux")]
 pub use linux::server::{BoxentServer, Session};

@@ -63,6 +63,16 @@ pub enum ReapReason {
 }
 
 impl ReapReason {
+    pub const ALL: [Self; 7] = [
+        Self::Destroyed,
+        Self::Idle,
+        Self::Ttl,
+        Self::AgentFailed,
+        Self::Retired,
+        Self::Shutdown,
+        Self::RestoreFailed,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Destroyed => "destroyed",

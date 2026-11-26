@@ -3,7 +3,8 @@
 # Safety settings (checked by `boxent doctor`):
 #   - no host directories are mounted: Lima mounts your home directory by default, which would put
 #     ~/.ssh and cloud credentials one sandbox escape away;
-#   - no guest ports are forwarded except the engine's Unix socket;
+#   - no guest ports are forwarded except the engine's Unix socket and, on the Mac's loopback
+#     only, the optional Streamable HTTP port (7788);
 #   - the VM cannot reach services on the Mac's loopback (127.0.0.1), and host proxy settings are
 #     not copied in;
 #   - no host SSH public keys or agent are passed in.
@@ -45,6 +46,12 @@ additionalDisks:
 portForwards:
 - guestSocket: /run/boxent/boxent.sock
   hostSocket: "{{.Dir}}/sock/boxent.sock"
+# Streamable HTTP, when enabled in /etc/boxent/boxent.toml: VM loopback 7788 to Mac loopback 7788.
+- guestIP: 127.0.0.1
+  guestPort: 7788
+  hostIP: 127.0.0.1
+  hostPort: 7788
+  proto: tcp
 # Everything else stays inside the VM. guestIPMustBeZero: false makes 0.0.0.0 match every guest
 # address (127.0.0.1 and ::1 included); Lima's default is true, which would let loopback ports through.
 - guestIP: 0.0.0.0

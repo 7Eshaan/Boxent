@@ -21,6 +21,7 @@ boxent-core = { path = "../boxent-core" }
 boxent-driver-oci = { path = "../boxent-driver-oci" }
 boxent-mcp = { path = "../boxent-mcp" }
 tokio.workspace = true
+mimalloc = { version = "0.1", default-features = false }
 toml = "1"
 tracing-subscriber.workspace = true
 boxent-proto = { path = "../boxent-proto" }

@@ -14,6 +14,33 @@ use clap::Args;
 use serde::Deserialize;
 
 const DEFAULT_CONFIG: &str = "/etc/boxent/boxent.toml";
+const DEFAULT_TOKEN_FILE: &str = "/etc/boxent/http-token";
+
+/// Reads the HTTP bearer token, or creates one (256 random bits, readable by root only).
+fn load_or_create_token(path: &Path) -> Result<String> {
+    if let Ok(t) = std::fs::read_to_string(path) {
+        return Ok(t.trim().to_owned());
+    }
+    let mut b = [0u8; 32];
+    // SAFETY: fills the buffer with random bytes.
+    if unsafe { libc::getrandom(b.as_mut_ptr().cast(), b.len(), 0) } != 32 {
+        anyhow::bail!("getrandom failed");
+    }
+    let token: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?
+        .write_all(format!("{token}\n").as_bytes())?;
+    Ok(token)
+}
 
 #[derive(Args)]
 pub struct DaemonArgs {
@@ -49,6 +76,8 @@ struct FileConfig {
     daemon: DaemonSection,
     #[serde(default)]
     limits: LimitsSection,
+    #[serde(default)]
+    http: HttpSection,
     #[serde(default, rename = "profile")]
     profiles: Vec<Profile>,
 }
@@ -63,6 +92,16 @@ struct DaemonSection {
     idle_secs: Option<u64>,
     session_grace_secs: Option<u64>,
     max_snapshots: Option<usize>,
+}
+
+/// Streamable HTTP. Off unless `listen` is set.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HttpSection {
+    /// Loopback address and port, e.g. "127.0.0.1:7788".
+    listen: Option<std::net::SocketAddr>,
+    /// File holding the bearer token; created with a random token if missing.
+    token_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -105,7 +144,22 @@ pub fn run(a: DaemonArgs) -> Result<bool> {
     let secs = |flag: Option<u64>, file: Option<u64>, default: Duration| {
         flag.or(file).map_or(default, Duration::from_secs)
     };
+    let http = match file.http.listen {
+        None => None,
+        Some(listen) => {
+            let path = file
+                .http
+                .token_file
+                .clone()
+                .unwrap_or_else(|| DEFAULT_TOKEN_FILE.into());
+            Some(boxent_mcp::HttpOptions {
+                listen,
+                token: load_or_create_token(&path)?,
+            })
+        }
+    };
     let opts = DaemonOptions {
+        http,
         socket: a
             .socket
             .or(d.socket.clone())

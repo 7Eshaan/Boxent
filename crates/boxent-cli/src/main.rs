@@ -16,6 +16,12 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+/// The daemon churns through many short-lived allocations; mimalloc returns freed memory to the
+/// system, where musl's allocator lets the process grow.
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Default location of the Btrfs pool that holds images, workspaces and snapshots.
 pub const DEFAULT_DATA_DIR: &str = "/var/lib/boxent";
 

@@ -1,6 +1,7 @@
 //! The proxy server for one sandbox.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -19,6 +20,13 @@ const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Counters shared by every sandbox's proxy, for metrics.
+#[derive(Debug, Default)]
+pub struct EgressStats {
+    pub allowed: AtomicU64,
+    pub denied: AtomicU64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProxyOptions {
     /// Connections open at once for one sandbox.
@@ -26,6 +34,7 @@ pub struct ProxyOptions {
     /// Refuse names that resolve to non-public addresses. Only tests turn this off, to reach a
     /// local upstream.
     pub block_private: bool,
+    pub stats: Arc<EgressStats>,
 }
 
 impl Default for ProxyOptions {
@@ -33,6 +42,7 @@ impl Default for ProxyOptions {
         Self {
             max_connections: 64,
             block_private: true,
+            stats: Arc::default(),
         }
     }
 }
@@ -113,7 +123,7 @@ async fn handle(mut client: TcpStream, sandbox: &str, profile: &Profile, opts: &
     let target = match http::parse(&buf[..head_len]) {
         Ok(t) => t,
         Err(d) => {
-            log(sandbox, profile, "-", 0, Some(&d));
+            log(opts, sandbox, profile, "-", 0, Some(&d));
             let msg = format!(
                 "boxent: egress denied: {} (profile '{}')",
                 d.reason(),
@@ -129,7 +139,7 @@ async fn handle(mut client: TcpStream, sandbox: &str, profile: &Profile, opts: &
     let addrs = match vet(&host, port, profile, opts).await {
         Ok(a) => a,
         Err(d) => {
-            log(sandbox, profile, &host, port, Some(&d));
+            log(opts, sandbox, profile, &host, port, Some(&d));
             let msg = format!(
                 "boxent: egress to {host}:{port} denied: {} (profile '{}')",
                 d.reason(),
@@ -156,6 +166,7 @@ async fn handle(mut client: TcpStream, sandbox: &str, profile: &Profile, opts: &
                 && sni.trim_end_matches('.') != host
             {
                 log(
+                    opts,
                     sandbox,
                     profile,
                     &host,
@@ -168,7 +179,7 @@ async fn handle(mut client: TcpStream, sandbox: &str, profile: &Profile, opts: &
             let Some(mut upstream) = connect(&addrs, port).await else {
                 return;
             };
-            log(sandbox, profile, &host, port, None);
+            log(opts, sandbox, profile, &host, port, None);
             if upstream.write_all(&first).await.is_err() {
                 return;
             }
@@ -184,7 +195,7 @@ async fn handle(mut client: TcpStream, sandbox: &str, profile: &Profile, opts: &
                 .await;
                 return;
             };
-            log(sandbox, profile, &host, port, None);
+            log(opts, sandbox, profile, &host, port, None);
             if upstream.write_all(&head).await.is_err() || upstream.write_all(&early).await.is_err()
             {
                 return;
@@ -290,7 +301,20 @@ async fn reject(mut client: TcpStream, code: u16, msg: &str) -> std::io::Result<
     client.shutdown().await
 }
 
-fn log(sandbox: &str, profile: &Profile, host: &str, port: u16, denied: Option<&Denied>) {
+fn log(
+    opts: &ProxyOptions,
+    sandbox: &str,
+    profile: &Profile,
+    host: &str,
+    port: u16,
+    denied: Option<&Denied>,
+) {
+    let counter = if denied.is_some() {
+        &opts.stats.denied
+    } else {
+        &opts.stats.allowed
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
     match denied {
         None => {
             tracing::info!(event = "egress_decision", sandbox_id = sandbox, profile = %profile.name, host, port, allowed = true)

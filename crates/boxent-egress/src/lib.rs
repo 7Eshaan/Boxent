@@ -18,4 +18,4 @@ mod proxy;
 pub mod tls;
 
 pub use policy::{Denied, Profile};
-pub use proxy::{PROXY_PORT, ProxyHandle, ProxyOptions, serve};
+pub use proxy::{EgressStats, PROXY_PORT, ProxyHandle, ProxyOptions, serve};

@@ -3,9 +3,10 @@
 A local, self-hosted sandbox engine for AI coding agents, served as an MCP server. Each sandbox is a
 disposable, isolated Linux environment with instant snapshot and restore of its workspace.
 
-Status: milestones M0 to M6 are done: development environment, in-sandbox agent and protocol,
-isolated sandboxes with crun, the engine with its warm pool and reaper, the MCP server,
-snapshot/restore, and egress allowlists. Streamable HTTP and hardening arrive in M7.
+Status: milestones M0 to M7 are done: development environment, in-sandbox agent and protocol,
+isolated sandboxes with crun, the engine with its warm pool and reaper, the MCP server over stdio
+and Streamable HTTP, snapshot/restore, egress allowlists, metrics and hardening. See
+[docs/threat-model.md](docs/threat-model.md) for what Boxent defends against and how.
 
 ## Use it from an MCP client
 
@@ -27,6 +28,15 @@ Tools: `run_bash`, `run_python`, `write_file`, `read_file`, `create_sandbox`, `d
 `/home/sandbox` at one instant (a read-only Btrfs snapshot, about 2 ms); `restore` rewinds them in
 the running sandbox, after killing its processes. Each sandbox has a 2 GiB disk budget that covers
 its files and all its snapshots, and holds up to 32 snapshots.
+
+### Streamable HTTP and metrics
+
+For daemons and several agents at once, the daemon can also serve MCP over Streamable HTTP. It is
+off by default. Set `[http] listen = "127.0.0.1:7788"` in `/etc/boxent/boxent.toml` and restart
+`boxentd`; Lima forwards that port to the Mac's loopback. Every request needs
+`Authorization: Bearer <token>` (`boxent vm http` prints the URL and token), requests from web
+pages (any `Origin` header) are refused, and `Host` must be a loopback name. Each MCP session gets
+its own default sandbox. `GET /metrics` returns Prometheus metrics behind the same token.
 
 ### Network access
 
@@ -56,11 +66,12 @@ seconds after the session ends.
 | `crates/boxent-egress` | Host-side egress proxy: allowlist profiles, private-address and SNI checks |
 | `crates/boxent-agent` | PID 1 agent inside every sandbox: reaping, commands in per-command cgroups, file access as the sandbox user |
 | `crates/boxent-proto` | Engine to agent wire protocol: length-prefixed CBOR frames, head/tail output capture |
-| `crates/boxent-mcp` | MCP tools with strict schemas, session routing, the daemon's socket server |
+| `crates/boxent-mcp` | MCP tools with strict schemas, session routing, the Unix-socket and Streamable HTTP servers |
 | `deploy/lima/boxent.yaml` | Lima template for the VM that hosts the engine on macOS |
 | `deploy/systemd/boxentd.service` | systemd unit for the daemon |
 | `config/boxent.example.toml` | Daemon settings, sandbox limits and egress profiles |
 | `tests/e2e` | Black-box tests through `boxent mcp` with the official Python MCP SDK |
+| `docs/threat-model.md` | Assets, attackers, controls and the tests that prove them, residual risks |
 | `images/base/build.sh` | Recipe for the base root filesystem (Ubuntu 26.04, bash, python3, git, curl) |
 | `xtask` | Developer tasks: `cargo xtask build-linux`, `vm-deploy`, `vm-test`, `e2e`, `ci` |
 
@@ -83,10 +94,11 @@ Inside the VM, as root, `boxent image build` creates the base image (about 90 se
 `cargo xtask vm-test [FILTER]` deploys the binaries and runs the kernel-level tests as root inside
 the VM: the agent tests, isolation suite B against real sandboxes, and lifecycle suite C plus the
 latency benchmark against the engine, snapshot suite D, egress suite B12 (needs the VM to reach
-example.com), and MCP session tests, each followed by a leak check.
+example.com), and the MCP session and HTTP (E6) tests, each followed by a leak check.
 `cargo xtask e2e` runs the black-box MCP suite from the Mac, through the relay and Lima's socket
 forwarding, using a local `.venv` with the official Python MCP SDK; it includes a Hypothesis
-model-based test of snapshot and restore (500 random sequences, about 2 minutes).
+model-based test of snapshot and restore (500 random sequences, about 2 minutes) and a daemon soak
+of 1,300 full sandbox lifecycles that checks memory and file descriptors.
 
 ## Development on Linux
 

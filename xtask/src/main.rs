@@ -161,7 +161,7 @@ fn systemctl(action: &str) -> Result<()> {
 }
 
 /// Test binaries that run inside the VM: package, cargo target selector, target name.
-const VM_TESTS: [(&str, &str, &str); 8] = [
+const VM_TESTS: [(&str, &str, &str); 10] = [
     ("boxent-agent", "--bin", "boxent-agent"),
     ("boxent-agent", "--test", "vm"),
     ("boxent-driver-oci", "--lib", "boxent_driver_oci"),
@@ -169,7 +169,9 @@ const VM_TESTS: [(&str, &str, &str); 8] = [
     ("boxent-core", "--test", "lifecycle"),
     ("boxent-core", "--test", "snapshots"),
     ("boxent-core", "--test", "egress"),
+    ("boxent-core", "--lib", "boxent_core"),
     ("boxent-mcp", "--test", "sessions"),
+    ("boxent-mcp", "--test", "http"),
 ];
 const VM_TEST_DIR: &str = "/tmp/boxent-vm-test";
 
@@ -284,8 +286,10 @@ fn ci() -> Result<()> {
         "-D",
         "warnings",
     ]))?;
-    // Clippy type-checks without linking, so this covers the Linux-only code paths from macOS.
-    run(cargo().args([
+    // Covers the Linux-only code paths from macOS; zig compiles the C parts (mimalloc).
+    let mut zig = Command::new("cargo-zigbuild");
+    zig.current_dir(root());
+    run(zig.args([
         "clippy",
         "--workspace",
         "--all-targets",

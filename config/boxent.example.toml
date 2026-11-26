@@ -10,6 +10,14 @@ idle_secs = 300          # destroyed after this long without a call
 session_grace_secs = 30  # a disconnected session's sandboxes survive this long
 max_snapshots = 32       # per sandbox
 
+# Streamable HTTP, for daemon and multi-agent use. Off unless `listen` is set. Loopback only;
+# every request needs `Authorization: Bearer <token>`, and requests with an Origin header (from
+# browsers) are refused. The token is created on first start (`boxent vm http` on macOS shows it).
+# On macOS, Lima forwards 127.0.0.1:7788 in the VM to 127.0.0.1:7788 on the Mac.
+[http]
+# listen = "127.0.0.1:7788"
+# token_file = "/etc/boxent/http-token"
+
 [limits]                 # per sandbox
 cpus = 1.0
 memory_mib = 512         # no swap

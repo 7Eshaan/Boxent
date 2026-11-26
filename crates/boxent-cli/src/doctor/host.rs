@@ -10,6 +10,7 @@ use crate::vm::{self, INSTANCE};
 
 const MIN_LIMA: (u32, u32, u32) = (2, 0, 0);
 const GUEST_SOCKET: &str = "/run/boxent/boxent.sock";
+const HTTP_PORT: u64 = 7788;
 const GUEST_BINARY: &str = "/usr/local/bin/boxent";
 
 pub fn checks() -> Vec<Check> {
@@ -178,8 +179,19 @@ pub fn config_checks(config: &Value) -> Vec<Check> {
             && f.get("guestIPMustBeZero").and_then(Value::as_bool) == Some(false)
             && f.get("proto").and_then(Value::as_str) == Some("any")
     });
-    checks.push(if has_socket && ignores_rest {
-        Check::pass("vm port forwards", format!("only {GUEST_SOCKET}"))
+    // The only TCP forward allowed is the HTTP port, from the VM's loopback to the Mac's.
+    let http_only = forwards.iter().all(|f| {
+        f.get("ignore").and_then(Value::as_bool) == Some(true)
+            || f.get("guestSocket").is_some()
+            || (f.get("guestPort").and_then(Value::as_u64) == Some(HTTP_PORT)
+                && f.get("guestIP").and_then(Value::as_str) == Some("127.0.0.1")
+                && f.get("hostIP").and_then(Value::as_str) == Some("127.0.0.1"))
+    });
+    checks.push(if has_socket && ignores_rest && http_only {
+        Check::pass(
+            "vm port forwards",
+            format!("only {GUEST_SOCKET} and the loopback HTTP port {HTTP_PORT}"),
+        )
     } else {
         Check::fail(
             "vm port forwards",
@@ -266,6 +278,31 @@ mod tests {
             ]
         });
         assert_eq!(config_checks(&cfg)[1].status, Status::Fail);
+    }
+
+    #[test]
+    fn extra_tcp_forward_fails_but_the_http_port_passes() {
+        let cfg = |extra: serde_json::Value| {
+            json!({
+                "mounts": [],
+                "networkOpts": {"hostLoopback": false},
+                "portForwards": [
+                    {"guestSocket": GUEST_SOCKET},
+                    extra,
+                    {"guestIP": "0.0.0.0", "guestIPMustBeZero": false, "proto": "any", "ignore": true}
+                ]
+            })
+        };
+        let http = cfg(
+            json!({"guestIP": "127.0.0.1", "guestPort": 7788, "hostIP": "127.0.0.1", "hostPort": 7788}),
+        );
+        assert_eq!(config_checks(&http)[1].status, Status::Pass);
+        let exposed = cfg(
+            json!({"guestIP": "127.0.0.1", "guestPort": 7788, "hostIP": "0.0.0.0", "hostPort": 7788}),
+        );
+        assert_eq!(config_checks(&exposed)[1].status, Status::Fail);
+        let other = cfg(json!({"guestIP": "127.0.0.1", "guestPort": 22, "hostIP": "127.0.0.1"}));
+        assert_eq!(config_checks(&other)[1].status, Status::Fail);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! The engine (Linux only).
 
 mod agent;
+mod metrics;
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -217,6 +218,7 @@ struct Inner {
     driver: OciDriver,
     state: Mutex<State>,
     refill: Arc<Notify>,
+    metrics: metrics::Metrics,
     _lock: File,
 }
 
@@ -275,6 +277,7 @@ impl Engine {
             driver,
             state: Mutex::new(State::default()),
             refill: Arc::new(Notify::new()),
+            metrics: metrics::Metrics::default(),
             _lock: lock,
         });
         tokio::spawn(refill_loop(Arc::downgrade(&inner)));
@@ -525,6 +528,9 @@ impl Engine {
         if let Err(e) = r.check(cfg.caps) {
             return Err(self.agent_violation(&a, e).await);
         }
+        self.inner
+            .metrics
+            .exec(r.duration_ms, r.timed_out, r.oom_killed);
         let digest = Sha256::digest(source);
         tracing::info!(
             event = "exec_finished",
@@ -640,6 +646,7 @@ impl Engine {
             created_at: std::time::SystemTime::now(),
         };
         lock(&a.snapshots).push(info.clone());
+        self.inner.metrics.snapshot();
         tracing::info!(
             event = "snapshot_created",
             sandbox_id = %a.id,
@@ -702,6 +709,7 @@ impl Engine {
         };
         self.agent_call(&a, Request::Exec(wipe), Duration::from_secs(12))
             .await?;
+        self.inner.metrics.restore();
         tracing::info!(
             event = "snapshot_restored",
             sandbox_id = %a.id,
@@ -758,6 +766,23 @@ impl Engine {
             expires_in: a.expires.saturating_duration_since(now),
             idle_for: now - last,
             calls_in_flight: a.inflight.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Metrics in Prometheus text format.
+    pub fn metrics_text(&self) -> String {
+        let s = self.stats();
+        let egress = &self.inner.cfg.proxy.stats;
+        self.inner.metrics.render(&metrics::Gauges {
+            warm: s.warm,
+            active: s.active,
+            provisioning: s.provisioning,
+            claims_warm: s.claims_warm,
+            claims_cold: s.claims_cold,
+            created: s.created,
+            create_failures: s.create_failures,
+            egress_allowed: egress.allowed.load(Ordering::Relaxed),
+            egress_denied: egress.denied.load(Ordering::Relaxed),
         })
     }
 
@@ -974,6 +999,7 @@ async fn reap(inner: &Arc<Inner>, id: &str, reason: ReapReason) -> bool {
         };
         st.reaped.insert(id.to_owned(), reason);
         st.stats.reaped += 1;
+        inner.metrics.reaped(reason);
         st.tearing_down += 1;
         a
     };
@@ -998,6 +1024,7 @@ async fn reap(inner: &Arc<Inner>, id: &str, reason: ReapReason) -> bool {
 async fn retire(inner: &Arc<Inner>, w: Warm) {
     tracing::info!(event = "sandbox_retired", sandbox_id = %w.sb.id(), age_ms = w.born.elapsed().as_millis() as u64);
     inner.state().stats.reaped += 1;
+    inner.metrics.reaped(ReapReason::Retired);
     destroy_blocking(w.sb).await;
     inner.state().tearing_down -= 1;
     inner.refill.notify_one();

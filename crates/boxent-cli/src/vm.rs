@@ -37,6 +37,8 @@ pub enum VmCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Show the Streamable HTTP endpoint and its bearer token (when HTTP is enabled).
+    Http,
     /// Delete the VM and its data disk.
     Delete {
         /// Required: confirms that the VM and all data on its disk are destroyed.
@@ -64,6 +66,32 @@ pub fn run(cmd: VmCommand) -> Result<()> {
                 ),
                 None => println!("{INSTANCE}: not created (run `boxent vm up`)"),
             }
+            Ok(())
+        }
+        VmCommand::Http => {
+            let out = Command::new("limactl")
+                .args([
+                    "shell",
+                    "--workdir",
+                    "/",
+                    INSTANCE,
+                    "sudo",
+                    "cat",
+                    "/etc/boxent/http-token",
+                ])
+                .stderr(Stdio::null())
+                .output()
+                .context("reading the token from the VM")?;
+            let token = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if !out.status.success() || token.is_empty() {
+                bail!(
+                    "HTTP is not enabled: set [http] listen = \"127.0.0.1:7788\" in /etc/boxent/boxent.toml \
+                     in the VM and restart boxentd (see config/boxent.example.toml)"
+                );
+            }
+            println!("url:   http://127.0.0.1:7788/mcp");
+            println!("token: {token}");
+            println!("header: Authorization: Bearer {token}");
             Ok(())
         }
         VmCommand::Shell { args } => {

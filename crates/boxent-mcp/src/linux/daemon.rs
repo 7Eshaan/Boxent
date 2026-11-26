@@ -26,6 +26,8 @@ pub struct DaemonOptions {
     /// explicit sandbox_id can carry on.
     pub session_grace: Duration,
     pub engine: EngineConfig,
+    /// Streamable HTTP listener, if enabled.
+    pub http: Option<super::http::HttpOptions>,
 }
 
 static SESSIONS: AtomicU64 = AtomicU64::new(1);
@@ -45,6 +47,15 @@ pub async fn run(opts: DaemonOptions) -> Result<(), EngineError> {
     }
     tracing::info!(event = "daemon_listening", socket = %opts.socket.display());
 
+    let stop_http = tokio_util::sync::CancellationToken::new();
+    let http = opts.http.clone().map(|h| {
+        let (engine, stop) = (engine.clone(), stop_http.clone());
+        tokio::spawn(async move {
+            if let Err(e) = super::http::serve_http(engine, h, stop).await {
+                tracing::error!(event = "http_failed", error = %e);
+            }
+        })
+    });
     let mut term = signal(SignalKind::terminate()).map_err(EngineError::internal)?;
     let mut int = signal(SignalKind::interrupt()).map_err(EngineError::internal)?;
     loop {
@@ -60,6 +71,10 @@ pub async fn run(opts: DaemonOptions) -> Result<(), EngineError> {
         }
     }
     tracing::info!(event = "daemon_stopping");
+    stop_http.cancel();
+    if let Some(h) = http {
+        let _ = h.await;
+    }
     let _ = std::fs::remove_file(&opts.socket);
     engine.shutdown().await;
     Ok(())

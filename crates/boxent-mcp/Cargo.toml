@@ -13,13 +13,17 @@ serde_json.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 base64 = "0.22"
-rmcp = { version = "3.11", features = ["server", "macros", "transport-async-rw"] }
+rmcp = { version = "3.11", features = ["server", "macros", "transport-async-rw", "transport-streamable-http-server"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+http = "1"
+tokio-util = "0.7"
 boxent-core = { path = "../boxent-core" }
 tokio.workspace = true
 tracing.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 serde_json.workspace = true
+tokio-util = "0.7"
 boxent-core = { path = "../boxent-core" }
 boxent-driver-oci = { path = "../boxent-driver-oci" }
 libc.workspace = true

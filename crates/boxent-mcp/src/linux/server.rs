@@ -10,7 +10,8 @@ use boxent_core::{Engine, EngineError, ErrorCode, ExecOutcome, ExecSpec};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
-use rmcp::{Json, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::service::RequestContext;
+use rmcp::{Json, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use serde_json::json;
 
 use crate::schema::*;
@@ -64,6 +65,10 @@ impl Session {
 pub struct BoxentServer {
     engine: Engine,
     session: Arc<Session>,
+    /// Over HTTP, requests that carry no MCP session id (the stateless 2026-07-28 protocol)
+    /// share this session's default sandbox. Agents working side by side should use
+    /// `create_sandbox` and pass `sandbox_id`.
+    stateless: Option<Arc<Session>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -83,12 +88,37 @@ impl BoxentServer {
         Self {
             engine,
             session,
+            stateless: None,
             tool_router: Self::tool_router(),
         }
     }
 
+    /// A server for one Streamable HTTP session (or one stateless request).
+    pub fn new_http(engine: Engine, stateless: Arc<Session>) -> Self {
+        Self {
+            stateless: Some(stateless),
+            ..Self::new(engine, Arc::new(Session::default()))
+        }
+    }
+
+    fn session(&self, ctx: &RequestContext<RoleServer>) -> Arc<Session> {
+        let sessionless = ctx
+            .extensions
+            .get::<http::request::Parts>()
+            .is_some_and(|p| !p.headers.contains_key("mcp-session-id"));
+        match &self.stateless {
+            Some(shared) if sessionless => Arc::clone(shared),
+            _ => Arc::clone(&self.session),
+        }
+    }
+
     /// Picks the sandbox for a call: the named one, or the session default (claimed on first use). If the default was reaped, the error is reported once and the next call starts a fresh default.
-    async fn resolve(&self, explicit: Option<String>) -> Result<String, CallToolResult> {
+    async fn resolve(
+        &self,
+        explicit: Option<String>,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Result<String, CallToolResult> {
+        let session = self.session(ctx);
         if let Some(id) = explicit {
             if id.is_empty()
                 || id.len() > 64
@@ -98,7 +128,7 @@ impl BoxentServer {
             }
             return Ok(id);
         }
-        let mut default = self.session.default.lock().await;
+        let mut default = session.default.lock().await;
         if let Some(id) = default.as_ref() {
             match self.engine.info(id) {
                 Ok(_) => return Ok(id.clone()),
@@ -109,13 +139,14 @@ impl BoxentServer {
             }
         }
         let id = self.engine.claim().await.map_err(tool_error)?;
-        self.session.own(&id);
+        session.own(&id);
         *default = Some(id.clone());
         Ok(id)
     }
 
     async fn run(
         &self,
+        ctx: &RequestContext<RoleServer>,
         id: Option<String>,
         spec: ExecSpec,
         timeout_sec: Option<u32>,
@@ -125,7 +156,7 @@ impl BoxentServer {
         {
             return Err(invalid("timeout_sec must be between 1 and 600"));
         }
-        let id = self.resolve(id).await?;
+        let id = self.resolve(id, ctx).await?;
         let o: ExecOutcome = self
             .engine
             .exec(
@@ -164,8 +195,9 @@ impl BoxentServer {
     async fn run_bash(
         &self,
         Parameters(a): Parameters<RunBashArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<Json<ExecOutput>, CallToolResult> {
-        self.run(a.sandbox_id, ExecSpec::Bash(a.command), a.timeout_sec)
+        self.run(&ctx, a.sandbox_id, ExecSpec::Bash(a.command), a.timeout_sec)
             .await
     }
 
@@ -179,8 +211,9 @@ impl BoxentServer {
     async fn run_python(
         &self,
         Parameters(a): Parameters<RunPythonArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<Json<ExecOutput>, CallToolResult> {
-        self.run(a.sandbox_id, ExecSpec::Python(a.code), a.timeout_sec)
+        self.run(&ctx, a.sandbox_id, ExecSpec::Python(a.code), a.timeout_sec)
             .await
     }
 
@@ -195,6 +228,7 @@ impl BoxentServer {
     async fn write_file(
         &self,
         Parameters(a): Parameters<WriteFileArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<Json<WriteFileOutput>, CallToolResult> {
         let content = match a.encoding.unwrap_or_default() {
             Encoding::Utf8 => a.content.into_bytes(),
@@ -208,7 +242,7 @@ impl BoxentServer {
                 parse_mode(m).ok_or_else(|| invalid("mode must be octal digits like \"644\""))?,
             ),
         };
-        let id = self.resolve(a.sandbox_id).await?;
+        let id = self.resolve(a.sandbox_id, &ctx).await?;
         let n = self
             .engine
             .write_file(&id, &a.path, content, mode)
@@ -226,6 +260,7 @@ impl BoxentServer {
     async fn read_file(
         &self,
         Parameters(a): Parameters<ReadFileArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<Json<ReadFileOutput>, CallToolResult> {
         let max = a.max_bytes.unwrap_or(DEFAULT_READ_BYTES);
         if max == 0 || max > MAX_READ_BYTES {
@@ -233,7 +268,7 @@ impl BoxentServer {
                 "max_bytes must be between 1 and {MAX_READ_BYTES}"
             )));
         }
-        let id = self.resolve(a.sandbox_id).await?;
+        let id = self.resolve(a.sandbox_id, &ctx).await?;
         let r = self
             .engine
             .read_file(&id, &a.path, a.offset.unwrap_or(0), max)
@@ -263,12 +298,13 @@ impl BoxentServer {
     async fn create_sandbox(
         &self,
         Parameters(a): Parameters<CreateSandboxArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<Json<CreateSandboxOutput>, CallToolResult> {
         let name = a
             .profile
             .unwrap_or_else(|| boxent_core::DEFAULT_PROFILE.into());
         let id = self.engine.claim_with(&name).await.map_err(tool_error)?;
-        self.session.own(&id);
+        self.session(&ctx).own(&id);
         let profile = self.engine.info(&id).map_err(tool_error)?.profile;
         let cfg = self.engine.config();
         Ok(Json(CreateSandboxOutput {
@@ -292,16 +328,20 @@ impl BoxentServer {
     async fn destroy_sandbox(
         &self,
         Parameters(a): Parameters<DestroySandboxArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<Json<DestroySandboxOutput>, CallToolResult> {
-        let id =
-            match a.sandbox_id {
-                Some(id) => id,
-                None => self.session.default.lock().await.take().ok_or_else(|| {
-                    invalid("this session has no default sandbox; pass sandbox_id")
-                })?,
-            };
+        let id = match a.sandbox_id {
+            Some(id) => id,
+            None => self
+                .session(&ctx)
+                .default
+                .lock()
+                .await
+                .take()
+                .ok_or_else(|| invalid("this session has no default sandbox; pass sandbox_id"))?,
+        };
         self.engine.destroy(&id).await.map_err(tool_error)?;
-        self.session.disown(&id);
+        self.session(&ctx).disown(&id);
         Ok(Json(DestroySandboxOutput {
             sandbox_id: id,
             destroyed: true,
@@ -317,8 +357,9 @@ impl BoxentServer {
     async fn snapshot(
         &self,
         Parameters(a): Parameters<SnapshotArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<Json<SnapshotOutput>, CallToolResult> {
-        let id = self.resolve(a.sandbox_id).await?;
+        let id = self.resolve(a.sandbox_id, &ctx).await?;
         let info = self
             .engine
             .snapshot(&id, a.label)
@@ -350,8 +391,9 @@ impl BoxentServer {
     async fn restore(
         &self,
         Parameters(a): Parameters<RestoreArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<Json<RestoreOutput>, CallToolResult> {
-        let id = self.resolve(a.sandbox_id).await?;
+        let id = self.resolve(a.sandbox_id, &ctx).await?;
         let killed = self
             .engine
             .restore(&id, &a.snap_id)
@@ -374,8 +416,9 @@ impl BoxentServer {
     async fn list_snapshots(
         &self,
         Parameters(a): Parameters<ListSnapshotsArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<Json<ListSnapshotsOutput>, CallToolResult> {
-        let id = self.resolve(a.sandbox_id).await?;
+        let id = self.resolve(a.sandbox_id, &ctx).await?;
         let snapshots = self
             .engine
             .list_snapshots(&id)
@@ -405,8 +448,9 @@ impl BoxentServer {
     async fn delete_snapshot(
         &self,
         Parameters(a): Parameters<DeleteSnapshotArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<Json<DeleteSnapshotOutput>, CallToolResult> {
-        let id = self.resolve(a.sandbox_id).await?;
+        let id = self.resolve(a.sandbox_id, &ctx).await?;
         self.engine
             .delete_snapshot(&id, &a.snap_id)
             .await
