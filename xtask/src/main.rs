@@ -161,13 +161,14 @@ fn systemctl(action: &str) -> Result<()> {
 }
 
 /// Test binaries that run inside the VM: package, cargo target selector, target name.
-const VM_TESTS: [(&str, &str, &str); 7] = [
+const VM_TESTS: [(&str, &str, &str); 8] = [
     ("boxent-agent", "--bin", "boxent-agent"),
     ("boxent-agent", "--test", "vm"),
     ("boxent-driver-oci", "--lib", "boxent_driver_oci"),
     ("boxent-driver-oci", "--test", "isolation"),
     ("boxent-core", "--test", "lifecycle"),
     ("boxent-core", "--test", "snapshots"),
+    ("boxent-core", "--test", "egress"),
     ("boxent-mcp", "--test", "sessions"),
 ];
 const VM_TEST_DIR: &str = "/tmp/boxent-vm-test";

@@ -187,3 +187,17 @@ async def test_sandbox_ids_work_across_sessions():
             out = await ok(s2, "run_bash", command="cat shared.txt", sandbox_id=sid)
             assert out["stdout"] == "hello"
         await ok(s1, "destroy_sandbox", sandbox_id=sid)
+
+
+async def test_egress_is_denied_by_default_with_a_clear_message():
+    async with open_session() as session:
+        created = await ok(session, "create_sandbox")
+        assert created["profile"] == "default" and created["egress_allow"] == []
+        sid = created["sandbox_id"]
+        out = await ok(session, "run_bash", command="curl -s -m 20 http://example.com/", sandbox_id=sid)
+        assert "denied" in out["stdout"] and "profile 'default'" in out["stdout"], out["stdout"]
+        out = await ok(session, "run_bash", command="curl -sS -m 20 https://example.com/", sandbox_id=sid)
+        assert out["exit_code"] != 0 and "403" in out["stderr"], out["stderr"]
+        err, is_err = await call(session, "create_sandbox", profile="everything")
+        assert is_err and err["code"] == "invalid_argument" and "default" in err["message"]
+        await ok(session, "destroy_sandbox", sandbox_id=sid)

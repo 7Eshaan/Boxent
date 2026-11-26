@@ -10,6 +10,7 @@ publish.workspace = true
 boxent-proto = { path = "../boxent-proto" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+boxent-egress = { path = "../boxent-egress" }
 boxent-driver-oci = { path = "../boxent-driver-oci" }
 libc.workspace = true
 sha2.workspace = true

@@ -124,7 +124,7 @@ pub struct ReadFileOutput {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreateSandboxArgs {
-    /// Sandbox profile set by the operator. Only `default` exists until egress profiles arrive.
+    /// Egress profile defined by the operator. `default` (the default) has no internet access; other profiles allow HTTP(S) to listed domains through the sandbox's proxy, which HTTP_PROXY/HTTPS_PROXY already point to. An unknown name returns the list of profiles.
     #[serde(default)]
     pub profile: Option<String>,
 }
@@ -134,6 +134,10 @@ pub struct CreateSandboxOutput {
     /// Pass this as `sandbox_id` to other tools. It is a secret capability: anyone who has it can use the sandbox.
     pub sandbox_id: String,
     pub profile: String,
+    /// Hosts this sandbox may reach over HTTP(S): `example.com` exactly, `*.example.com` for subdomains. Empty means no internet access.
+    pub egress_allow: Vec<String>,
+    /// Destination ports allowed for those hosts.
+    pub egress_ports: Vec<u16>,
     /// Seconds until the sandbox is destroyed regardless of use.
     pub expires_in_sec: u64,
     /// Seconds without any call after which the sandbox is destroyed.

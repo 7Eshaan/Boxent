@@ -321,3 +321,21 @@ pub fn random_hex() -> io::Result<String> {
     }
     Ok(b.iter().map(|x| format!("{x:02x}")).collect())
 }
+
+/// Opens a TCP listener on 127.0.0.1:`port` inside the network namespace pinned at `netns`.
+///
+/// A socket stays in the namespace it was created in, so the engine can serve it from the host
+/// while sandbox processes connect to it on their loopback. A short-lived thread joins the
+/// namespace (allowed per thread for network namespaces) and creates the socket.
+pub fn listen_in_netns(netns: &Path, port: u16) -> io::Result<std::net::TcpListener> {
+    let ns = std::fs::File::open(netns)?;
+    std::thread::spawn(move || {
+        // SAFETY: setns on a namespace descriptor we own; it affects only this thread.
+        if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        std::net::TcpListener::bind(("127.0.0.1", port))
+    })
+    .join()
+    .map_err(|_| io::Error::other("netns listener thread panicked"))?
+}

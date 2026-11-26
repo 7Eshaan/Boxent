@@ -1,0 +1,43 @@
+# Boxent daemon configuration. Copy to /etc/boxent/boxent.toml (inside the VM on macOS) and
+# restart the daemon: `sudo systemctl restart boxentd`. Every setting is optional; command-line
+# flags override this file.
+
+[daemon]
+pool_size = 4            # warm sandboxes kept ready
+max_sandboxes = 32       # warm + active + starting
+ttl_secs = 1800          # hard lifetime of a sandbox
+idle_secs = 300          # destroyed after this long without a call
+session_grace_secs = 30  # a disconnected session's sandboxes survive this long
+max_snapshots = 32       # per sandbox
+
+[limits]                 # per sandbox
+cpus = 1.0
+memory_mib = 512         # no swap
+pids = 256
+disk_mib = 2048          # workspace, home and all snapshots together
+tmp_mib = 64
+
+# Egress profiles. Sandboxes have no internet access unless an agent creates one with a profile
+# (create_sandbox profile="..."). Agents cannot add domains. The proxy only allows HTTP and
+# HTTPS (CONNECT) to the hosts listed, resolves names itself, refuses names that resolve to
+# private or local addresses, and checks that TLS goes to the host the tunnel was opened for.
+#
+# `allow`: "example.com" matches exactly; "*.example.com" matches any subdomain (not the apex).
+# `ports`: defaults to [443, 80].
+#
+# Defining a profile named "default" replaces the built-in default, which allows nothing.
+
+[[profile]]
+name = "pypi"
+allow = ["pypi.org", "files.pythonhosted.org"]
+ports = [443]
+
+[[profile]]
+name = "github"
+allow = ["github.com", "codeload.github.com", "*.githubusercontent.com"]
+ports = [443]
+
+[[profile]]
+name = "npm"
+allow = ["registry.npmjs.org"]
+ports = [443]

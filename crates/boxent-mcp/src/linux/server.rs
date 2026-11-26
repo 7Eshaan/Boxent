@@ -16,7 +16,9 @@ use serde_json::json;
 use crate::schema::*;
 
 const INSTRUCTIONS: &str = "Boxent runs code in disposable, isolated Linux sandboxes \
-(Ubuntu with bash, python3, git and curl; no network access). Every tool takes an optional \
+(Ubuntu with bash, python3, git and curl). Sandboxes have no internet access unless created \
+with create_sandbox and an egress profile that allows specific domains over HTTP(S). \
+Every tool takes an optional \
 sandbox_id; without one, calls go to this session's default sandbox, created on first use. \
 Files persist between calls in /workspace; each run_bash call starts a fresh shell. \
 Call snapshot before a risky change and restore to rewind /workspace and /home/sandbox \
@@ -262,18 +264,18 @@ impl BoxentServer {
         &self,
         Parameters(a): Parameters<CreateSandboxArgs>,
     ) -> Result<Json<CreateSandboxOutput>, CallToolResult> {
-        let profile = a.profile.unwrap_or_else(|| "default".into());
-        if profile != "default" {
-            return Err(invalid(format!(
-                "unknown profile '{profile}' (available: default)"
-            )));
-        }
-        let id = self.engine.claim().await.map_err(tool_error)?;
+        let name = a
+            .profile
+            .unwrap_or_else(|| boxent_core::DEFAULT_PROFILE.into());
+        let id = self.engine.claim_with(&name).await.map_err(tool_error)?;
         self.session.own(&id);
+        let profile = self.engine.info(&id).map_err(tool_error)?.profile;
         let cfg = self.engine.config();
         Ok(Json(CreateSandboxOutput {
             sandbox_id: id,
-            profile,
+            profile: profile.name,
+            egress_allow: profile.allow,
+            egress_ports: profile.ports,
             expires_in_sec: cfg.ttl.as_secs(),
             idle_timeout_sec: cfg.idle_timeout.as_secs(),
         }))

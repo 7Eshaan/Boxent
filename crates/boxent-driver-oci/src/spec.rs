@@ -65,6 +65,8 @@ impl Default for Limits {
 }
 
 pub const SANDBOX_UID: u32 = 1000;
+/// Port of the egress proxy listener on the sandbox's loopback.
+pub const PROXY_PORT: u16 = 3128;
 pub const WORKSPACE: &str = "/workspace";
 pub const HOME: &str = "/home/sandbox";
 /// Where the agent binary is mounted inside the sandbox (a mount point baked into the image).

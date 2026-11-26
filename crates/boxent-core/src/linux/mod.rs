@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use boxent_driver_oci::{DriverConfig, Limits, OciDriver, Sandbox};
+use boxent_egress::{Profile, ProxyHandle, ProxyOptions};
 use boxent_proto::{
     Caps, ExecRequest, MAX_FILE, ReadFileRequest, ReadFileResult, Request, Response,
     WriteFileRequest,
@@ -28,6 +29,10 @@ const PING_DEADLINE: Duration = Duration::from_secs(1);
 /// How many reaped sandbox ids are remembered, to answer "reaped" rather than "not found".
 const REAPED_MEMORY: usize = 4096;
 const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// The profile used when none is named. Unless the operator redefines it, it allows nothing.
+pub const DEFAULT_PROFILE: &str = "default";
+const PROXY_URL: &str = "http://127.0.0.1:3128";
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -51,6 +56,10 @@ pub struct EngineConfig {
     pub caps: Caps,
     /// Snapshots one sandbox may hold at a time.
     pub max_snapshots: usize,
+    /// Egress profiles agents may choose from. A `default` profile denying everything is added
+    /// at start if the operator did not define one.
+    pub profiles: Vec<Profile>,
+    pub proxy: ProxyOptions,
     /// Sandboxes created in parallel by the refill task.
     pub create_parallelism: usize,
 }
@@ -71,6 +80,8 @@ impl Default for EngineConfig {
             max_timeout: Duration::from_secs(600),
             caps: Caps::default(),
             max_snapshots: 32,
+            profiles: Vec::new(),
+            proxy: ProxyOptions::default(),
             create_parallelism: 2,
         }
     }
@@ -112,6 +123,8 @@ pub struct SnapshotInfo {
 #[derive(Debug, Clone)]
 pub struct SandboxInfo {
     pub id: String,
+    /// The egress profile the sandbox was claimed with.
+    pub profile: Profile,
     pub age: Duration,
     pub expires_in: Duration,
     pub idle_for: Duration,
@@ -139,12 +152,15 @@ enum Source {
 struct Warm {
     sb: Sandbox,
     conn: AgentConn,
+    /// The sandbox's egress proxy; denies everything until the sandbox is claimed.
+    proxy: ProxyHandle,
     born: Instant,
 }
 
 struct Active {
     id: String,
     conn: AgentConn,
+    proxy: ProxyHandle,
     sb: Arc<Mutex<Option<Sandbox>>>,
     /// Serialises snapshot, restore and snapshot deletion for this sandbox.
     ops: tokio::sync::Mutex<()>,
@@ -219,7 +235,22 @@ pub struct Engine {
 impl Engine {
     /// Takes the engine lock, reaps whatever a previous engine left behind, and starts the
     /// refill and reaper tasks. Must be called inside a Tokio runtime.
-    pub async fn start(cfg: EngineConfig) -> Result<Self, EngineError> {
+    pub async fn start(mut cfg: EngineConfig) -> Result<Self, EngineError> {
+        for p in &cfg.profiles {
+            p.validate()
+                .map_err(|e| EngineError::new(ErrorCode::InvalidArgument, e))?;
+        }
+        let mut names: Vec<&str> = cfg.profiles.iter().map(|p| p.name.as_str()).collect();
+        names.sort_unstable();
+        if names.windows(2).any(|w| w[0] == w[1]) {
+            return Err(EngineError::new(
+                ErrorCode::InvalidArgument,
+                "duplicate profile names",
+            ));
+        }
+        if !cfg.profiles.iter().any(|p| p.name == DEFAULT_PROFILE) {
+            cfg.profiles.insert(0, Profile::deny_all(DEFAULT_PROFILE));
+        }
         let driver_cfg = cfg.driver.clone();
         let (lock, driver, swept) = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&driver_cfg.state_dir).map_err(EngineError::internal)?;
@@ -258,6 +289,39 @@ impl Engine {
     /// Claims a sandbox: a warm one if available, otherwise a new one. Waits up to
     /// `claim_timeout` when the engine is at `max_sandboxes`.
     pub async fn claim(&self) -> Result<String, EngineError> {
+        self.claim_with(DEFAULT_PROFILE).await
+    }
+
+    /// The operator-defined egress profiles, by name.
+    pub fn profiles(&self) -> &[Profile] {
+        &self.inner.cfg.profiles
+    }
+
+    /// Claims a sandbox whose egress follows the named profile.
+    pub async fn claim_with(&self, profile: &str) -> Result<String, EngineError> {
+        let profile = self
+            .inner
+            .cfg
+            .profiles
+            .iter()
+            .find(|p| p.name == profile)
+            .cloned()
+            .ok_or_else(|| {
+                let names: Vec<&str> = self
+                    .inner
+                    .cfg
+                    .profiles
+                    .iter()
+                    .map(|p| p.name.as_str())
+                    .collect();
+                EngineError::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "unknown profile '{profile}' (available: {})",
+                        names.join(", ")
+                    ),
+                )
+            })?;
         let start = Instant::now();
         let deadline = start + self.inner.cfg.claim_timeout;
         loop {
@@ -278,7 +342,9 @@ impl Engine {
             self.inner.refill.notify_one();
             if let Some(w) = taken {
                 match w.conn.call(Request::Ping, PING_DEADLINE).await {
-                    Ok(Response::Pong) => return Ok(self.activate(w, start, Source::Warm)),
+                    Ok(Response::Pong) => {
+                        return Ok(self.activate(w, start, Source::Warm, profile));
+                    }
                     _ => {
                         tracing::warn!(event = "warm_sandbox_unhealthy", sandbox_id = %w.sb.id());
                         {
@@ -315,7 +381,7 @@ impl Engine {
                             "engine is shutting down",
                         ))
                     }
-                    Ok(w) => Ok(self.activate(w, start, Source::Cold)),
+                    Ok(w) => Ok(self.activate(w, start, Source::Cold, profile)),
                     Err(e) => {
                         let mut st = self.inner.state();
                         st.provisioning -= 1;
@@ -339,13 +405,16 @@ impl Engine {
 
     /// Moves a sandbox into the active set. The counter it was held under (claiming or
     /// provisioning) is released in the same critical section, so the total never dips.
-    fn activate(&self, w: Warm, start: Instant, from: Source) -> String {
+    fn activate(&self, w: Warm, start: Instant, from: Source, profile: Profile) -> String {
         let cold = from == Source::Cold;
         let now = Instant::now();
         let id = w.sb.id().to_owned();
+        let profile_name = profile.name.clone();
+        w.proxy.set_profile(profile);
         let active = Arc::new(Active {
             id: id.clone(),
             conn: w.conn,
+            proxy: w.proxy,
             sb: Arc::new(Mutex::new(Some(w.sb))),
             ops: tokio::sync::Mutex::new(()),
             snapshots: Mutex::new(Vec::new()),
@@ -369,6 +438,7 @@ impl Engine {
         tracing::info!(
             event = "sandbox_claimed",
             sandbox_id = %id,
+            profile = %profile_name,
             acquire_ms = start.elapsed().as_secs_f64() * 1000.0,
             cold,
             pool_depth = st.warm.len()
@@ -683,6 +753,7 @@ impl Engine {
         let last = *a.last_used.lock().unwrap_or_else(|e| e.into_inner());
         Ok(SandboxInfo {
             id: a.id.clone(),
+            profile: (*a.proxy.profile()).clone(),
             age: now - a.claimed,
             expires_in: a.expires.saturating_duration_since(now),
             idle_for: now - last,
@@ -849,10 +920,22 @@ async fn create_one(inner: &Arc<Inner>) -> Result<Warm, EngineError> {
     .await
     .map_err(EngineError::internal)?
     .map_err(|e| EngineError::internal(format!("creating a sandbox: {e}")))?;
+    let mut sb = sb;
+    let listener = sb
+        .take_proxy_listener()
+        .ok_or_else(|| EngineError::internal("the sandbox has no egress listener"))?;
+    let proxy = boxent_egress::serve(
+        listener,
+        sb.id().to_owned(),
+        Profile::deny_all("unclaimed"),
+        inner.cfg.proxy.clone(),
+    )
+    .map_err(EngineError::internal)?;
     let conn = AgentConn::new(stream).map_err(EngineError::internal)?;
     Ok(Warm {
         sb,
         conn,
+        proxy,
         born: Instant::now(),
     })
 }
@@ -1059,6 +1142,14 @@ fn default_env() -> Vec<(String, String)> {
         ("LANG", "C.UTF-8"),
         ("TERM", "dumb"),
         ("PYTHONUNBUFFERED", "1"),
+        // The only way out of a sandbox: the egress proxy on its loopback. With the default
+        // profile it refuses every destination, with a message that says so.
+        ("HTTP_PROXY", PROXY_URL),
+        ("HTTPS_PROXY", PROXY_URL),
+        ("http_proxy", PROXY_URL),
+        ("https_proxy", PROXY_URL),
+        ("NO_PROXY", "localhost,127.0.0.1,::1"),
+        ("no_proxy", "localhost,127.0.0.1,::1"),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_owned(), v.to_owned()))

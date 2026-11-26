@@ -3,9 +3,9 @@
 A local, self-hosted sandbox engine for AI coding agents, served as an MCP server. Each sandbox is a
 disposable, isolated Linux environment with instant snapshot and restore of its workspace.
 
-Status: milestones M0 to M5 are done: development environment, in-sandbox agent and protocol,
-isolated sandboxes with crun, the engine with its warm pool and reaper, the MCP server, and
-snapshot/restore. Egress allowlists arrive in M6, Streamable HTTP and hardening in M7.
+Status: milestones M0 to M6 are done: development environment, in-sandbox agent and protocol,
+isolated sandboxes with crun, the engine with its warm pool and reaper, the MCP server,
+snapshot/restore, and egress allowlists. Streamable HTTP and hardening arrive in M7.
 
 ## Use it from an MCP client
 
@@ -27,6 +27,22 @@ Tools: `run_bash`, `run_python`, `write_file`, `read_file`, `create_sandbox`, `d
 `/home/sandbox` at one instant (a read-only Btrfs snapshot, about 2 ms); `restore` rewinds them in
 the running sandbox, after killing its processes. Each sandbox has a 2 GiB disk budget that covers
 its files and all its snapshots, and holds up to 32 snapshots.
+
+### Network access
+
+Sandboxes have no network interface besides loopback. Their only way out is an HTTP proxy at
+`127.0.0.1:3128` (already set in `HTTP_PROXY`/`HTTPS_PROXY`), served by the daemon from outside
+the sandbox. By default it refuses everything. The operator defines egress profiles in
+`/etc/boxent/boxent.toml` (see `config/boxent.example.toml`), and an agent picks one with
+`create_sandbox profile="pypi"`. The proxy allows HTTPS and plain HTTP to the listed hosts only,
+resolves names itself, refuses names that resolve to private or local addresses, and checks that
+TLS goes to the host the tunnel was opened for. To use the example profiles in the VM:
+
+```bash
+limactl copy config/boxent.example.toml boxent:/tmp/boxent.toml
+limactl shell boxent sudo install -D -m 0644 /tmp/boxent.toml /etc/boxent/boxent.toml
+limactl shell boxent sudo systemctl restart boxentd
+```
 Calls without a `sandbox_id` share one sandbox per session, created on first use and destroyed 30
 seconds after the session ends.
 
@@ -37,12 +53,13 @@ seconds after the session ends.
 | `crates/boxent-cli` | The `boxent` binary: `doctor`, `vm`, `image`, `sandbox`, and later `daemon` and `mcp` |
 | `crates/boxent-core` | Engine: warm pool, claim, exec, file ops, snapshots, idle and TTL reaping, crash recovery |
 | `crates/boxent-driver-oci` | Isolation driver: user and network namespaces, idmapped mounts, cgroups, seccomp, crun |
-| `crates/boxent-egress` | Host-side egress proxy (M6) |
+| `crates/boxent-egress` | Host-side egress proxy: allowlist profiles, private-address and SNI checks |
 | `crates/boxent-agent` | PID 1 agent inside every sandbox: reaping, commands in per-command cgroups, file access as the sandbox user |
 | `crates/boxent-proto` | Engine to agent wire protocol: length-prefixed CBOR frames, head/tail output capture |
 | `crates/boxent-mcp` | MCP tools with strict schemas, session routing, the daemon's socket server |
 | `deploy/lima/boxent.yaml` | Lima template for the VM that hosts the engine on macOS |
 | `deploy/systemd/boxentd.service` | systemd unit for the daemon |
+| `config/boxent.example.toml` | Daemon settings, sandbox limits and egress profiles |
 | `tests/e2e` | Black-box tests through `boxent mcp` with the official Python MCP SDK |
 | `images/base/build.sh` | Recipe for the base root filesystem (Ubuntu 26.04, bash, python3, git, curl) |
 | `xtask` | Developer tasks: `cargo xtask build-linux`, `vm-deploy`, `vm-test`, `e2e`, `ci` |
@@ -65,8 +82,8 @@ Inside the VM, as root, `boxent image build` creates the base image (about 90 se
 `cargo xtask ci` runs formatting, clippy for macOS and Linux targets, and the unit tests.
 `cargo xtask vm-test [FILTER]` deploys the binaries and runs the kernel-level tests as root inside
 the VM: the agent tests, isolation suite B against real sandboxes, and lifecycle suite C plus the
-latency benchmark against the engine, snapshot suite D, and MCP session tests, each followed by a
-leak check.
+latency benchmark against the engine, snapshot suite D, egress suite B12 (needs the VM to reach
+example.com), and MCP session tests, each followed by a leak check.
 `cargo xtask e2e` runs the black-box MCP suite from the Mac, through the relay and Lima's socket
 forwarding, using a local `.venv` with the official Python MCP SDK; it includes a Hypothesis
 model-based test of snapshot and restore (500 random sequences, about 2 minutes).

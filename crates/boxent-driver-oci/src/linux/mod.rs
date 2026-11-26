@@ -18,7 +18,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use boxent_proto::{Client, Request};
 
-use crate::spec::{self, DriverConfig, Limits, SANDBOX_UID, SpecPaths};
+use crate::spec::{self, DriverConfig, Limits, PROXY_PORT, SANDBOX_UID, SpecPaths};
 
 /// First host UID handed out; slot n maps container 0-65535 to `UID_BASE + n * 65536`.
 const UID_BASE: u32 = 1 << 20;
@@ -94,6 +94,7 @@ impl OciDriver {
             data_dir: self.cfg.data_dir.clone(),
             qgroup: None,
             agent_pid: 0,
+            proxy_listener: None,
             destroyed: false,
         };
         self.setup(&mut sb, limits)
@@ -126,6 +127,10 @@ impl OciDriver {
             Ok(())
         })
         .context("creating the network namespace")?;
+        sb.proxy_listener = Some(
+            sys::listen_in_netns(&netns, PROXY_PORT)
+                .context("creating the egress proxy listener")?,
+        );
 
         fs::create_dir_all(sb.storage.join("snaps"))?;
         let qgroup = btrfs::next_qgroup(&self.cfg.data_dir)?;
@@ -336,6 +341,9 @@ pub struct Sandbox {
     qgroup: Option<String>,
     /// The agent's PID on the host, used to enter the sandbox's mount namespace.
     agent_pid: u32,
+    /// Listening socket at 127.0.0.1:3128 inside the sandbox's network namespace, for the
+    /// engine's egress proxy.
+    proxy_listener: Option<std::net::TcpListener>,
     destroyed: bool,
 }
 
@@ -365,6 +373,11 @@ impl Sandbox {
 
     pub fn client(&mut self) -> &mut Client<UnixStream> {
         self.client.as_mut().expect("sandbox is running")
+    }
+
+    /// Hands the egress proxy's listener (inside the sandbox's network namespace) to the caller.
+    pub fn take_proxy_listener(&mut self) -> Option<std::net::TcpListener> {
+        self.proxy_listener.take()
     }
 
     /// Hands the agent connection to the caller (the engine's async client). The handshake has
