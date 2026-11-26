@@ -2,6 +2,7 @@
 //!
 //! - `build-linux [--debug]`: static arm64 Linux binaries via `cargo zigbuild`.
 //! - `vm-deploy [--debug]`: build, then install the binaries into the Lima VM.
+//! - `vm-test [FILTER]`: build the agent and its tests for Linux and run them as root in the VM.
 //! - `ci`: formatting, clippy for the host and for Linux, unit tests.
 
 use std::path::{Path, PathBuf};
@@ -23,9 +24,10 @@ fn main() -> Result<()> {
     match args.first().map(String::as_str) {
         Some("build-linux") => build_linux(debug).map(drop),
         Some("vm-deploy") => vm_deploy(debug),
+        Some("vm-test") => vm_test(args.get(1).filter(|a| !a.starts_with("--")).cloned()),
         Some("ci") => ci(),
         _ => {
-            eprintln!("usage: cargo xtask <build-linux|vm-deploy|ci> [--debug]");
+            eprintln!("usage: cargo xtask <build-linux|vm-deploy|vm-test [FILTER]|ci> [--debug]");
             std::process::exit(2);
         }
     }
@@ -102,6 +104,77 @@ fn vm_deploy(debug: bool) -> Result<()> {
         run(Command::new("limactl").args(["shell", "--workdir", "/", VM, "rm", "-f", &staged]))?;
     }
     eprintln!("deployed to the '{VM}' VM; check it with `boxent doctor`");
+    Ok(())
+}
+
+/// Test binaries that run inside the VM: package, cargo target selector, target name.
+const VM_TESTS: [(&str, &str, &str); 2] = [
+    ("boxent-agent", "--bin", "boxent-agent"),
+    ("boxent-agent", "--test", "vm"),
+];
+const VM_TEST_DIR: &str = "/tmp/boxent-vm-test";
+
+fn vm_test(filter: Option<String>) -> Result<()> {
+    let release = build_linux(false)?;
+    let mut binaries = Vec::new();
+    for (package, selector, target) in VM_TESTS {
+        let out = cargo()
+            .args([
+                "zigbuild",
+                "--target",
+                LINUX_TARGET,
+                "--release",
+                "--tests",
+                "-p",
+                package,
+            ])
+            .args([selector, target])
+            .args(["--message-format", "json-render-diagnostics"])
+            .stderr(std::process::Stdio::inherit())
+            .output()
+            .context("building VM tests")?;
+        if !out.status.success() {
+            bail!("building {package} tests failed");
+        }
+        let exe = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["reason"] == "compiler-artifact" && v["profile"]["test"] == true)
+            .filter(|v| v["target"]["name"] == target)
+            .find_map(|v| v["executable"].as_str().map(PathBuf::from))
+            .with_context(|| format!("no test executable for {package} {selector} {target}"))?;
+        binaries.push((format!("{package}-{}-tests", target), exe));
+    }
+    let shell = |args: &[&str]| {
+        let mut c = Command::new("limactl");
+        c.args(["shell", "--workdir", "/", VM]).args(args);
+        c
+    };
+    run(&mut shell(&["mkdir", "-p", VM_TEST_DIR]))?;
+    let agent = format!("{VM_TEST_DIR}/boxent-agent");
+    run(Command::new("limactl")
+        .arg("copy")
+        .arg(release.join("boxent-agent"))
+        .arg(format!("{VM}:{agent}")))?;
+    for (name, exe) in &binaries {
+        let dest = format!("{VM_TEST_DIR}/{name}");
+        run(Command::new("limactl")
+            .arg("copy")
+            .arg(exe)
+            .arg(format!("{VM}:{dest}")))?;
+        let mut args = vec![
+            "sudo".to_owned(),
+            "env".into(),
+            "BOXENT_VM_TESTS=1".into(),
+            format!("BOXENT_AGENT_BIN={agent}"),
+            dest,
+            "--test-threads=1".into(),
+            "--nocapture".into(),
+        ];
+        args.extend(filter.clone());
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        run(&mut shell(&args))?;
+    }
     Ok(())
 }
 

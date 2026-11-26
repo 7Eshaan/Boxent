@@ -6,7 +6,13 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
-[dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
+boxent-proto = { path = "../boxent-proto" }
+libc.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+boxent-proto = { path = "../boxent-proto" }
+libc.workspace = true
 
 [lints]
 workspace = true
