@@ -17,7 +17,11 @@ serde.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+boxent-core = { path = "../boxent-core" }
 boxent-driver-oci = { path = "../boxent-driver-oci" }
+boxent-mcp = { path = "../boxent-mcp" }
+tokio.workspace = true
+tracing-subscriber.workspace = true
 boxent-proto = { path = "../boxent-proto" }
 libc.workspace = true
 

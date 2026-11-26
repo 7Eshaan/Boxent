@@ -24,6 +24,7 @@ pub fn checks() -> Vec<Check> {
     match vm::instance() {
         Ok(Some(inst)) => {
             checks.push(running(&inst));
+            checks.push(daemon_socket(&inst));
             checks.extend(config_checks(inst.get("config").unwrap_or(&Value::Null)));
         }
         Ok(None) => checks.push(Check::fail(
@@ -218,6 +219,21 @@ pub fn config_checks(config: &Value) -> Vec<Check> {
         )
     });
     checks
+}
+
+/// The daemon's socket, forwarded from the VM by Lima, accepts connections.
+fn daemon_socket(inst: &Value) -> Check {
+    const NAME: &str = "daemon socket";
+    let dir = vm::str_field(inst, "dir");
+    let path = std::path::Path::new(dir).join("sock").join("boxent.sock");
+    match std::os::unix::net::UnixStream::connect(&path) {
+        Ok(_) => Check::pass(NAME, format!("{} accepts connections", path.display())),
+        Err(e) => Check::fail(
+            NAME,
+            format!("{}: {e}", path.display()),
+            "cargo xtask vm-deploy (installs and starts boxentd in the VM)",
+        ),
+    }
 }
 
 #[cfg(test)]

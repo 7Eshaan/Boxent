@@ -1,0 +1,5 @@
+# Black-box tests that drive Boxent the way an MCP client does, through `boxent mcp`.
+mcp==2.3.0
+pytest==9.*
+pytest-asyncio==1.*
+jsonschema==4.*

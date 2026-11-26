@@ -120,6 +120,12 @@ pub struct PoolStats {
     pub create_failures: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Warm,
+    Cold,
+}
+
 struct Warm {
     sb: Sandbox,
     conn: AgentConn,
@@ -160,6 +166,10 @@ struct State {
     warm: VecDeque<Warm>,
     active: HashMap<String, Arc<Active>>,
     provisioning: usize,
+    /// Taken from the pool by a claim that is still checking its health.
+    claiming: usize,
+    /// Out of service but not yet destroyed; still counted against `max_sandboxes`.
+    tearing_down: usize,
     reaped: Reaped,
     stopped: bool,
     stats: PoolStats,
@@ -169,7 +179,7 @@ struct State {
 
 impl State {
     fn total(&self) -> usize {
-        self.warm.len() + self.active.len() + self.provisioning
+        self.warm.len() + self.active.len() + self.provisioning + self.claiming + self.tearing_down
     }
 }
 
@@ -246,15 +256,24 @@ impl Engine {
                         "engine is shutting down",
                     ));
                 }
-                st.warm.pop_front()
+                let w = st.warm.pop_front();
+                if w.is_some() {
+                    st.claiming += 1;
+                }
+                w
             };
             self.inner.refill.notify_one();
             if let Some(w) = taken {
                 match w.conn.call(Request::Ping, PING_DEADLINE).await {
-                    Ok(Response::Pong) => return Ok(self.activate(w, start, false)),
+                    Ok(Response::Pong) => return Ok(self.activate(w, start, Source::Warm)),
                     _ => {
                         tracing::warn!(event = "warm_sandbox_unhealthy", sandbox_id = %w.sb.id());
-                        self.retire(w).await;
+                        {
+                            let mut st = self.inner.state();
+                            st.claiming -= 1;
+                            st.tearing_down += 1;
+                        }
+                        retire(&self.inner, w).await;
                         continue;
                     }
                 }
@@ -270,22 +289,27 @@ impl Engine {
             if reserved {
                 let created = create_one(&self.inner).await;
                 let stopped = self.inner.state().stopped;
-                let result = match created {
+                return match created {
                     Ok(w) if stopped => {
+                        {
+                            let mut st = self.inner.state();
+                            st.provisioning -= 1;
+                            st.tearing_down += 1;
+                        }
                         retire(&self.inner, w).await;
                         Err(EngineError::new(
                             ErrorCode::Internal,
                             "engine is shutting down",
                         ))
                     }
-                    Ok(w) => Ok(w),
+                    Ok(w) => Ok(self.activate(w, start, Source::Cold)),
                     Err(e) => {
-                        self.inner.state().stats.create_failures += 1;
+                        let mut st = self.inner.state();
+                        st.provisioning -= 1;
+                        st.stats.create_failures += 1;
                         Err(e)
                     }
                 };
-                self.inner.state().provisioning -= 1;
-                return result.map(|w| self.activate(w, start, true));
             }
             if Instant::now() >= deadline {
                 return Err(EngineError::new(
@@ -300,7 +324,10 @@ impl Engine {
         }
     }
 
-    fn activate(&self, w: Warm, start: Instant, cold: bool) -> String {
+    /// Moves a sandbox into the active set. The counter it was held under (claiming or
+    /// provisioning) is released in the same critical section, so the total never dips.
+    fn activate(&self, w: Warm, start: Instant, from: Source) -> String {
+        let cold = from == Source::Cold;
         let now = Instant::now();
         let id = w.sb.id().to_owned();
         let active = Arc::new(Active {
@@ -314,6 +341,10 @@ impl Engine {
             seq: AtomicU64::new(1),
         });
         let mut st = self.inner.state();
+        match from {
+            Source::Warm => st.claiming -= 1,
+            Source::Cold => st.provisioning -= 1,
+        }
         st.active.insert(id.clone(), active);
         if cold {
             st.stats.claims_cold += 1;
@@ -529,11 +560,12 @@ impl Engine {
             let mut st = self.inner.state();
             st.stopped = true;
             let warm: Vec<Warm> = st.warm.drain(..).collect();
+            st.tearing_down += warm.len();
             let active: Vec<String> = st.active.keys().cloned().collect();
             (warm, active)
         };
         for w in warm {
-            self.retire(w).await;
+            retire(&self.inner, w).await;
         }
         for id in active {
             self.reap(&id, ReapReason::Shutdown).await;
@@ -545,9 +577,14 @@ impl Engine {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        let late: Vec<Warm> = self.inner.state().warm.drain(..).collect();
+        let late: Vec<Warm> = {
+            let mut st = self.inner.state();
+            let late: Vec<Warm> = st.warm.drain(..).collect();
+            st.tearing_down += late.len();
+            late
+        };
         for w in late {
-            self.retire(w).await;
+            retire(&self.inner, w).await;
         }
         tracing::info!(event = "engine_stopped");
     }
@@ -555,10 +592,6 @@ impl Engine {
     /// Removes a claimed sandbox from service and destroys it. False if it was not active.
     async fn reap(&self, id: &str, reason: ReapReason) -> bool {
         reap(&self.inner, id, reason).await
-    }
-
-    async fn retire(&self, w: Warm) {
-        retire(&self.inner, w).await;
     }
 
     async fn agent_call(
@@ -683,6 +716,7 @@ async fn reap(inner: &Arc<Inner>, id: &str, reason: ReapReason) -> bool {
         };
         st.reaped.insert(id.to_owned(), reason);
         st.stats.reaped += 1;
+        st.tearing_down += 1;
         a
     };
     let sb = a.sb.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -696,14 +730,18 @@ async fn reap(inner: &Arc<Inner>, id: &str, reason: ReapReason) -> bool {
     if let Some(sb) = sb {
         destroy_blocking(sb).await;
     }
+    inner.state().tearing_down -= 1;
     inner.refill.notify_one();
     true
 }
 
+/// Destroys a sandbox that was never claimed. The caller has already counted it in
+/// `tearing_down`; this releases that count once it is gone.
 async fn retire(inner: &Arc<Inner>, w: Warm) {
     tracing::info!(event = "sandbox_retired", sandbox_id = %w.sb.id(), age_ms = w.born.elapsed().as_millis() as u64);
     inner.state().stats.reaped += 1;
     destroy_blocking(w.sb).await;
+    inner.state().tearing_down -= 1;
     inner.refill.notify_one();
 }
 
@@ -804,6 +842,7 @@ async fn reaper_loop(weak: Weak<Inner>) {
                 .drain(..)
                 .partition(|w| w.conn.is_alive() && w.born.elapsed() < max_age);
             st.warm = keep.into();
+            st.tearing_down += stale.len();
             (expired, stale)
         };
         for (id, reason) in expired {

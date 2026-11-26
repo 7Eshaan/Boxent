@@ -1,0 +1,20 @@
+[Unit]
+Description=Boxent sandbox engine (MCP daemon)
+After=local-fs.target
+RequiresMountsFor=/var/lib/boxent
+
+[Service]
+Type=simple
+# BOXENT_SOCKET_UID (the login user, so Lima can forward the socket) and other overrides.
+EnvironmentFile=-/etc/boxent/daemon.env
+ExecStart=/usr/local/bin/boxent daemon
+Restart=on-failure
+RestartSec=1
+# Sandboxes run in their own cgroups, outside this unit. On SIGTERM the daemon destroys them
+# itself; after a crash, the restarted daemon sweeps them up.
+KillMode=process
+TimeoutStopSec=30
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

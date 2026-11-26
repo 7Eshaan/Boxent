@@ -6,6 +6,9 @@
 #[cfg(target_os = "linux")]
 mod dev;
 mod doctor;
+mod relay;
+#[cfg(target_os = "linux")]
+mod serve;
 mod vm;
 
 use std::path::PathBuf;
@@ -44,6 +47,20 @@ enum Command {
         #[arg(long, default_value = DEFAULT_DATA_DIR)]
         data_dir: PathBuf,
     },
+    /// MCP server over stdio, for IDEs and agents. Relays to the Boxent daemon (on macOS, the one
+    /// in the VM, which is started if needed).
+    Mcp {
+        /// Daemon socket. Defaults to /run/boxent/boxent.sock on Linux and the Lima-forwarded
+        /// socket on macOS.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Fail instead of starting a stopped VM (macOS).
+        #[arg(long)]
+        no_start: bool,
+    },
+    /// Run the engine and serve MCP sessions on a Unix socket (Linux, as root).
+    #[cfg(target_os = "linux")]
+    Daemon(serve::DaemonArgs),
     /// Manage the Lima VM that runs the engine on macOS.
     Vm {
         #[command(subcommand)]
@@ -76,6 +93,9 @@ fn main() -> ExitCode {
             data_dir,
         }),
         Command::Vm { command } => vm::run(command).map(|()| true),
+        Command::Mcp { socket, no_start } => relay::run(socket, no_start),
+        #[cfg(target_os = "linux")]
+        Command::Daemon(args) => serve::run(args),
         #[cfg(target_os = "linux")]
         Command::Image { command } => dev::image(command),
         #[cfg(target_os = "linux")]

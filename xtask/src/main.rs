@@ -3,6 +3,8 @@
 //! - `build-linux [--debug]`: static arm64 Linux binaries via `cargo zigbuild`.
 //! - `vm-deploy [--debug]`: build, then install the binaries into the Lima VM.
 //! - `vm-test [FILTER]`: build the agent and its tests for Linux and run them as root in the VM.
+//! - `e2e [PYTEST ARGS]`: black-box MCP tests from this machine through `boxent mcp`, using the
+//!   official Python MCP SDK (suite E and the client-side latency of suite A).
 //! - `ci`: formatting, clippy for the host and for Linux, unit tests.
 
 use std::path::{Path, PathBuf};
@@ -25,9 +27,12 @@ fn main() -> Result<()> {
         Some("build-linux") => build_linux(debug).map(drop),
         Some("vm-deploy") => vm_deploy(debug),
         Some("vm-test") => vm_test(args.get(1).filter(|a| !a.starts_with("--")).cloned()),
+        Some("e2e") => e2e(&args[1..]),
         Some("ci") => ci(),
         _ => {
-            eprintln!("usage: cargo xtask <build-linux|vm-deploy|vm-test [FILTER]|ci> [--debug]");
+            eprintln!(
+                "usage: cargo xtask <build-linux|vm-deploy|vm-test [FILTER]|e2e [ARGS]|ci> [--debug]"
+            );
             std::process::exit(2);
         }
     }
@@ -103,17 +108,66 @@ fn vm_deploy(debug: bool) -> Result<()> {
         ]))?;
         run(Command::new("limactl").args(["shell", "--workdir", "/", VM, "rm", "-f", &staged]))?;
     }
-    eprintln!("deployed to the '{VM}' VM; check it with `boxent doctor`");
+    install_service()?;
+    eprintln!("deployed to the '{VM}' VM and restarted boxentd; check it with `boxent doctor`");
     Ok(())
 }
 
+const UNIT: &str = include_str!("../../deploy/systemd/boxentd.service");
+
+/// Installs the systemd unit and (re)starts the daemon. The socket is owned by the VM's login
+/// user so Lima can forward it to the Mac.
+fn install_service() -> Result<()> {
+    let out = Command::new("limactl")
+        .args(["shell", "--workdir", "/", VM, "id", "-u"])
+        .output()
+        .context("asking the VM for the login user's UID")?;
+    let uid = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if uid.is_empty() || !uid.bytes().all(|b| b.is_ascii_digit()) {
+        bail!("unexpected UID from the VM: {uid:?}");
+    }
+    let script = format!(
+        "set -e\n\
+         install -d -m 0755 /etc/boxent\n\
+         printf 'BOXENT_SOCKET_UID={uid}\\n' > /etc/boxent/daemon.env\n\
+         cat > /etc/systemd/system/boxentd.service <<'UNIT'\n{UNIT}UNIT\n\
+         systemctl daemon-reload\n\
+         systemctl enable --quiet boxentd\n\
+         systemctl restart boxentd\n"
+    );
+    run(Command::new("limactl").args([
+        "shell",
+        "--workdir",
+        "/",
+        VM,
+        "sudo",
+        "bash",
+        "-c",
+        &script,
+    ]))
+}
+
+fn systemctl(action: &str) -> Result<()> {
+    run(Command::new("limactl").args([
+        "shell",
+        "--workdir",
+        "/",
+        VM,
+        "sudo",
+        "systemctl",
+        action,
+        "boxentd",
+    ]))
+}
+
 /// Test binaries that run inside the VM: package, cargo target selector, target name.
-const VM_TESTS: [(&str, &str, &str); 5] = [
+const VM_TESTS: [(&str, &str, &str); 6] = [
     ("boxent-agent", "--bin", "boxent-agent"),
     ("boxent-agent", "--test", "vm"),
     ("boxent-driver-oci", "--lib", "boxent_driver_oci"),
     ("boxent-driver-oci", "--test", "isolation"),
     ("boxent-core", "--test", "lifecycle"),
+    ("boxent-mcp", "--test", "sessions"),
 ];
 const VM_TEST_DIR: &str = "/tmp/boxent-vm-test";
 
@@ -130,6 +184,14 @@ fn vm_test(filter: Option<String>) -> Result<()> {
         "image",
         "build",
     ]))?;
+    // The tests start their own engines; the daemon would hold the engine lock and sandboxes.
+    systemctl("stop")?;
+    let result = run_vm_tests(filter);
+    systemctl("start")?;
+    result
+}
+
+fn run_vm_tests(filter: Option<String>) -> Result<()> {
     let release = root().join("target").join(LINUX_TARGET).join("release");
     let mut binaries = Vec::new();
     for (package, selector, target) in VM_TESTS {
@@ -192,6 +254,22 @@ fn vm_test(filter: Option<String>) -> Result<()> {
         run(&mut shell(&args))?;
     }
     Ok(())
+}
+
+fn e2e(pytest_args: &[String]) -> Result<()> {
+    let venv = root().join(".venv");
+    if !venv.join("bin/pytest").exists() {
+        run(Command::new("python3").arg("-m").arg("venv").arg(&venv))?;
+        run(Command::new(venv.join("bin/pip"))
+            .args(["install", "-q", "-r"])
+            .arg(root().join("tests/e2e/requirements.txt")))?;
+    }
+    run(cargo().args(["build", "-q", "-p", "boxent-cli"]))?;
+    run(Command::new(venv.join("bin/pytest"))
+        .current_dir(root().join("tests/e2e"))
+        .arg("-s")
+        .args(pytest_args)
+        .env("BOXENT_BIN", root().join("target/debug/boxent")))
 }
 
 fn ci() -> Result<()> {

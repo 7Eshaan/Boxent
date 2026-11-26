@@ -7,6 +7,24 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+schemars = "1"
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+base64 = "0.22"
+rmcp = { version = "3.11", features = ["server", "macros", "transport-async-rw"] }
+boxent-core = { path = "../boxent-core" }
+tokio.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+serde_json.workspace = true
+boxent-core = { path = "../boxent-core" }
+boxent-driver-oci = { path = "../boxent-driver-oci" }
+libc.workspace = true
+rmcp = { version = "3.11", features = ["client", "transport-async-rw"] }
+tokio.workspace = true
 
 [lints]
 workspace = true
